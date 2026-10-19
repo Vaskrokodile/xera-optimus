@@ -164,7 +164,7 @@ const slash_cmds = [_]SlashCmd{
     .{ .name = "/leave", .desc = "leave the multiplayer session" },
     .{ .name = "/library", .desc = "adopted harness snapshots" },
     .{ .name = "/main", .desc = "return to the shared channel" },
-    .{ .name = "/model", .desc = "current model" },
+    .{ .name = "/model", .desc = "search and switch provider model" },
     .{ .name = "/multiplayer-create", .desc = "host a multiplayer session" },
     .{ .name = "/multiplayer-join", .desc = "join: /multiplayer-join <xmp-id>", .takes_arg = true },
     .{ .name = "/resume", .desc = "load a session: /resume <id>", .takes_arg = true },
@@ -201,6 +201,8 @@ const Event = union(enum) {
     mp_line: struct { peer: ?*mp.Peer, line: []const u8 },
     mp_peer_drop: *mp.Peer,
     mp_close: []const u8,
+    models: llm.ModelCatalog,
+    model_changed: []const u8,
 };
 
 const Job = union(enum) {
@@ -210,6 +212,8 @@ const Job = union(enum) {
     usage,
     summarize,
     load_msgs: std.ArrayList(std.json.Value),
+    list_models,
+    set_model: []const u8,
     quit,
 };
 
@@ -308,6 +312,7 @@ const ClickAction = union(enum) {
     peek_draft: []const u8, // author
     enter_thread: []const u8, // t-N
     enter_thread_prompt: []const u8, // p-N — create+open thread from this prompt
+    select_model: []const u8,
     close_overlay,
 };
 
@@ -318,7 +323,7 @@ const ClickZone = struct {
     act: ClickAction,
 };
 
-const Overlay = enum { none, draft_peek, thread_monitor };
+const Overlay = enum { none, draft_peek, thread_monitor, model_picker };
 
 const MpMode = enum { none, host, client };
 
@@ -344,7 +349,7 @@ fn authorColor(name: []const u8) []const u8 {
 
 pub const App = struct {
     alloc: std.mem.Allocator,
-    cfg: *const config.Config,
+    cfg: *config.Config,
     hclient: *http.HttpClient,
     h: *harness.Harness,
     cwd: []const u8,
@@ -390,6 +395,14 @@ pub const App = struct {
     overlay: Overlay = .none,
     peek_author: []const u8 = "",
     clicks: std.ArrayList(ClickZone),
+    model: []const u8,
+    models: [][]const u8 = &.{},
+    model_filter: std.ArrayList(u8),
+    model_filter_cursor: usize = 0,
+    model_sel: usize = 0,
+    model_loading: bool = false,
+    model_error: []const u8 = "",
+    overlay_cursor: ?Pos = null,
     last_typing_ms: i64 = 0,
     busy_threads: usize = 0,
 
@@ -398,7 +411,7 @@ pub const App = struct {
 
     pub fn run(
         alloc: std.mem.Allocator,
-        cfg: *const config.Config,
+        cfg: *config.Config,
         hclient: *http.HttpClient,
         h: *harness.Harness,
         cwd: []const u8,
@@ -431,6 +444,8 @@ pub const App = struct {
             .threads = std.StringHashMap(*MpThread).init(alloc),
             .peers = std.ArrayList([]const u8).init(alloc),
             .clicks = std.ArrayList(ClickZone).init(alloc),
+            .model = cfg.model,
+            .model_filter = std.ArrayList(u8).init(alloc),
             .name = std.process.getEnvVarOwned(alloc, "XERA_NAME") catch
                 std.process.getEnvVarOwned(alloc, "USERNAME") catch
                 std.process.getEnvVarOwned(alloc, "USER") catch "anon",
@@ -577,6 +592,23 @@ pub const App = struct {
                 self.peers.clearRetainingCapacity();
                 self.drafts.clearRetainingCapacity();
             },
+            .models => |catalog| {
+                self.models = catalog.models;
+                self.model_error = catalog.error_msg;
+                self.model_loading = false;
+                self.model_sel = 0;
+                if (catalog.error_msg.len > 0) try self.addSysFmt("✗ {s}", .{catalog.error_msg});
+            },
+            .model_changed => |model| {
+                self.model = model;
+                try self.updateWelcomeModel(model);
+                try self.addSysFmt("model switched to {s}", .{model});
+                if (self.mp_server) |srv| {
+                    const line = try std.fmt.allocPrint(self.alloc,
+                        "{{\"k\":\"model\",\"model\":\"{s}\"}}", .{try util.jescape(self.alloc, model)});
+                    srv.broadcast(line);
+                }
+            },
         }
     }
 
@@ -620,6 +652,22 @@ pub const App = struct {
         try self.blocks.append(.{ .sys = try std.fmt.allocPrint(self.alloc, fmt, args) });
     }
 
+    fn updateWelcomeModel(self: *App, model: []const u8) !void {
+        for (self.blocks.items) |*block| {
+            switch (block.*) {
+                .sys => |*text| {
+                    if (std.mem.startsWith(u8, text.*, "◆ xera-optimus — model ")) {
+                        text.* = try std.fmt.allocPrint(self.alloc, "◆ xera-optimus — model {s} · harness {s}", .{
+                            model, if (self.h.global) "global" else "project",
+                        });
+                        return;
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+
     // ---------- input ----------
 
     fn onKey(self: *App, k: Key) !void {
@@ -650,23 +698,24 @@ pub const App = struct {
             }
             return;
         }
-        // overlay consumes keys first (esc/enter close, clicks hit-test below)
+        if (self.overlay == .model_picker) {
+            try self.modelPickerKey(k);
+            return;
+        }
+        // other overlays consume keys (esc closes, clicks hit-test below)
         if (self.overlay != .none) {
             switch (k) {
-                .escape, .enter => {
-                    self.overlay = .none;
-                    return;
-                },
+                .escape, .enter => self.overlay = .none,
                 .mouse => |m| {
-                    if (m.down) self.clickAt(m.col, m.row);
-                    return;
+                    if (m.move) self.hoverAt(m.col, m.row) else if (m.down) self.clickAt(m.col, m.row);
                 },
-                else => return,
+                else => {},
             }
+            return;
         }
         if (k == .mouse) {
             const m = k.mouse;
-            if (m.down) self.clickAt(m.col, m.row);
+            if (m.move) self.hoverAt(m.col, m.row) else if (m.down) self.clickAt(m.col, m.row);
             return;
         }
         // slash dropdown owns navigation while open
@@ -860,6 +909,159 @@ pub const App = struct {
         self.scroll = @intCast(s);
     }
 
+    fn modelMatches(model: []const u8, query: []const u8) bool {
+        if (query.len == 0) return true;
+        if (query.len > model.len) return false;
+        for (0..model.len - query.len + 1) |i| {
+            if (std.ascii.eqlIgnoreCase(model[i .. i + query.len], query)) return true;
+        }
+        return false;
+    }
+
+    fn filteredModelCount(self: *const App) usize {
+        var count: usize = 0;
+        for (self.models) |model| if (modelMatches(model, self.model_filter.items)) {
+            count += 1;
+        };
+        return count;
+    }
+
+    fn filteredModel(self: *const App, selected: usize) ?[]const u8 {
+        var index: usize = 0;
+        for (self.models) |model| {
+            if (!modelMatches(model, self.model_filter.items)) continue;
+            if (index == selected) return model;
+            index += 1;
+        }
+        return null;
+    }
+
+    fn modelPickerKey(self: *App, k: Key) !void {
+        switch (k) {
+            .escape => self.overlay = .none,
+            .enter => if (self.filteredModel(self.model_sel)) |model| self.chooseModel(model),
+            .up => self.moveModelSelection(-1),
+            .down => self.moveModelSelection(1),
+            .page_up => self.moveModelSelection(-10),
+            .page_down => self.moveModelSelection(10),
+            .char => |cp| try self.insertModelFilter(cp),
+            .paste => |text| try self.insertModelFilterText(text),
+            .backspace => self.modelFilterBackspace(),
+            .delete => self.modelFilterDelete(),
+            .left => self.modelFilterMove(-1),
+            .right => self.modelFilterMove(1),
+            .home => self.model_filter_cursor = 0,
+            .end => self.model_filter_cursor = self.model_filter.items.len,
+            .mouse => |m| {
+                if (m.move) self.hoverAt(m.col, m.row) else if (m.down) self.clickAt(m.col, m.row);
+            },
+            .resize => self.full_redraw = true,
+            else => {},
+        }
+        self.dirty = true;
+    }
+
+    fn moveModelSelection(self: *App, delta: i32) void {
+        const count = self.filteredModelCount();
+        if (count == 0) return;
+        const n: i64 = @intCast(count);
+        var next: i64 = @intCast(self.model_sel);
+        next = @mod(next + delta, n);
+        self.model_sel = @intCast(next);
+    }
+
+    fn modelFilterMaxBytes(self: *App) usize {
+        return @max(1, @min(48, @as(usize, self.term.w) -| 18));
+    }
+
+    fn insertModelFilter(self: *App, cp: u21) !void {
+        var buf: [4]u8 = undefined;
+        const n = std.unicode.utf8Encode(cp, &buf) catch return;
+        if (self.model_filter.items.len + n > self.modelFilterMaxBytes()) return;
+        try self.model_filter.insertSlice(self.model_filter_cursor, buf[0..n]);
+        self.model_filter_cursor += n;
+        self.model_sel = 0;
+    }
+
+    fn insertModelFilterText(self: *App, text: []const u8) !void {
+        var i: usize = 0;
+        while (i < text.len) {
+            if (text[i] < 0x20 or text[i] == 0x7f) {
+                i += 1;
+                continue;
+            }
+            const len = if (text[i] < 0x80) 1 else (std.unicode.utf8ByteSequenceLength(text[i]) catch 1);
+            const take = @min(len, text.len - i);
+            if (self.model_filter.items.len + take <= self.modelFilterMaxBytes()) {
+                try self.model_filter.insertSlice(self.model_filter_cursor, text[i .. i + take]);
+                self.model_filter_cursor += take;
+            }
+            i += len;
+        }
+        self.model_sel = 0;
+    }
+
+    fn modelFilterBackspace(self: *App) void {
+        if (self.model_filter_cursor == 0) return;
+        var start = self.model_filter_cursor - 1;
+        while (start > 0 and (self.model_filter.items[start] & 0xC0) == 0x80) start -= 1;
+        const removed = self.model_filter_cursor - start;
+        const new_len = self.model_filter.items.len - removed;
+        std.mem.copyForwards(u8, self.model_filter.items[start..new_len], self.model_filter.items[self.model_filter_cursor..]);
+        self.model_filter.items.len = new_len;
+        self.model_filter_cursor = start;
+        self.model_sel = 0;
+    }
+
+    fn modelFilterDelete(self: *App) void {
+        if (self.model_filter_cursor >= self.model_filter.items.len) return;
+        var end = self.model_filter_cursor + 1;
+        while (end < self.model_filter.items.len and (self.model_filter.items[end] & 0xC0) == 0x80) end += 1;
+        const removed = end - self.model_filter_cursor;
+        std.mem.copyForwards(u8, self.model_filter.items[self.model_filter_cursor .. self.model_filter.items.len - removed], self.model_filter.items[end..]);
+        self.model_filter.items.len -= removed;
+        self.model_sel = 0;
+    }
+
+    fn modelFilterMove(self: *App, direction: i32) void {
+        if (direction < 0) {
+            if (self.model_filter_cursor == 0) return;
+            self.model_filter_cursor -= 1;
+            while (self.model_filter_cursor > 0 and (self.model_filter.items[self.model_filter_cursor] & 0xC0) == 0x80)
+                self.model_filter_cursor -= 1;
+        } else {
+            if (self.model_filter_cursor >= self.model_filter.items.len) return;
+            self.model_filter_cursor += 1;
+            while (self.model_filter_cursor < self.model_filter.items.len and (self.model_filter.items[self.model_filter_cursor] & 0xC0) == 0x80)
+                self.model_filter_cursor += 1;
+        }
+    }
+
+    fn openModelPicker(self: *App) void {
+        if (self.mp_mode == .client) {
+            self.addSys("the session host controls the shared model") catch {};
+            return;
+        }
+        self.overlay = .model_picker;
+        self.model_filter.clearRetainingCapacity();
+        self.model_filter_cursor = 0;
+        self.model_sel = 0;
+        self.model_loading = true;
+        self.model_error = "";
+        self.q.pushJob(.list_models);
+    }
+
+    fn chooseModel(self: *App, model: []const u8) void {
+        self.overlay = .none;
+        if (std.mem.eql(u8, model, self.model)) {
+            self.addSysFmt("{s} is already selected", .{model}) catch {};
+            return;
+        }
+        const owned = self.alloc.dupe(u8, model) catch return;
+        self.addSysFmt("switching model to {s}…", .{model}) catch {};
+        self.q.pushJob(.{ .set_model = owned });
+    }
+
     fn submit(self: *App) !void {
         const text = std.mem.trim(u8, self.composer.items, " \t\r\n");
         if (text.len == 0) return;
@@ -927,7 +1129,7 @@ pub const App = struct {
             self.auto = !self.auto;
             try self.addSysFmt("auto-approve {s}", .{if (self.auto) "on" else "off"});
         } else if (std.mem.eql(u8, name, "/model")) {
-            try self.addSysFmt("model: {s}  (switching not supported yet)", .{self.cfg.model});
+            self.openModelPicker();
         } else if (std.mem.eql(u8, name, "/usage")) {
             self.q.pushJob(.usage);
         } else if (std.mem.eql(u8, name, "/summarize") or std.mem.eql(u8, name, "/compact")) {
@@ -1175,8 +1377,8 @@ pub const App = struct {
             }
             // snapshot: hello + full entry log + current presence
             var hello = std.ArrayList(u8).init(a);
-            try hello.writer().print("{{\"k\":\"hello\",\"id\":\"{s}\",\"peers\":{s},\"log\":[",
-                .{ self.mp_id, try self.peersJson(a) });
+            try hello.writer().print("{{\"k\":\"hello\",\"id\":\"{s}\",\"model\":\"{s}\",\"peers\":{s},\"log\":[",
+                .{ self.mp_id, try util.jescape(a, self.model), try self.peersJson(a) });
             for (self.mp_log.items, 0..) |e, i| {
                 if (i > 0) try hello.append(',');
                 try hello.appendSlice(e);
@@ -1336,6 +1538,10 @@ pub const App = struct {
 
         if (std.mem.eql(u8, k, "hello")) {
             try self.addSysFmt("⬡ joined {s} — shared context synced", .{self.mp_id});
+            if (util.jstr(v, "model")) |model| {
+                self.model = try self.alloc.dupe(u8, model);
+                try self.updateWelcomeModel(self.model);
+            }
             if (util.jget(v, "peers")) |arr| {
                 self.peers.clearRetainingCapacity();
                 for (arr.array.items) |p| {
@@ -1347,6 +1553,13 @@ pub const App = struct {
                 for (arr.array.items) |e| try self.renderEntry(e);
             }
             try self.addSys("— caught up · your prompts go to the shared agent");
+            return;
+        }
+        if (std.mem.eql(u8, k, "model")) {
+            const model = util.jstr(v, "model") orelse return;
+            self.model = try self.alloc.dupe(u8, model);
+            try self.updateWelcomeModel(self.model);
+            try self.addSysFmt("session model is now {s}", .{self.model});
             return;
         }
         if (std.mem.eql(u8, k, "entry")) {
@@ -1524,6 +1737,29 @@ pub const App = struct {
         }
     }
 
+    fn hoverAt(self: *App, col: u16, row: u16) void {
+        if (self.overlay != .model_picker) return;
+        for (self.clicks.items) |zone| {
+            if (row != zone.row or col < zone.col0 or col > zone.col1) continue;
+            switch (zone.act) {
+                .select_model => |model| {
+                    for (0..self.filteredModelCount()) |i| {
+                        if (self.filteredModel(i)) |candidate| {
+                            if (std.mem.eql(u8, candidate, model)) {
+                                if (self.model_sel != i) {
+                                    self.model_sel = i;
+                                    self.dirty = true;
+                                }
+                                return;
+                            }
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+
     /// mouse click → hit-test the zones registered by the last render.
     fn clickAt(self: *App, col: u16, row: u16) void {
         for (self.clicks.items) |z| {
@@ -1542,6 +1778,7 @@ pub const App = struct {
                         self.overlay = .none;
                         self.threadCmd(pid) catch {};
                     },
+                    .select_model => |model| self.chooseModel(model),
                     .close_overlay => self.overlay = .none,
                 }
                 self.dirty = true;
@@ -1652,6 +1889,7 @@ pub const App = struct {
         const w: usize = self.term.w;
         const h: usize = self.term.h;
         self.clicks.clearRetainingCapacity();
+        self.overlay_cursor = null;
 
         var lines = std.ArrayList([]const u8).init(fa);
         try lines.append(try self.statusLine(fa, w));
@@ -1759,7 +1997,7 @@ pub const App = struct {
         if (self.overlay != .none) try self.renderOverlay(fa, &lines, w, h);
 
         // diff vs previous frame
-        const cursor = try self.cursorPos(fa, composer.items.len, busy_row + drop_rows.items.len);
+        const cursor = self.overlay_cursor orelse try self.cursorPos(fa, composer.items.len, busy_row + drop_rows.items.len);
         try self.paint(lines.items, h, cursor);
     }
 
@@ -1809,10 +2047,70 @@ pub const App = struct {
                     }
                 }
             },
+            .model_picker => {
+                try addc(&content, &acts, try std.fmt.allocPrint(fa, "{s}◈ Select a model · current: {s}{s}", .{
+                    sty.accent ++ sty.bold, self.model, sty.reset }), null);
+                try addc(&content, &acts, try std.fmt.allocPrint(fa, "{s}provider: {s}{s}", .{
+                    sty.gray, try clip(fa, self.cfg.base_url, bw -| 16), sty.reset }), null);
+                const search_prefix = "⌕ search: ";
+                try addc(&content, &acts, try std.fmt.allocPrint(fa, "{s}{s}{s}{s}", .{
+                    sty.cyan, search_prefix, self.model_filter.items, sty.reset }), null);
+                try addc(&content, &acts, try std.fmt.allocPrint(fa, "{s}type to filter · ↑↓ navigate · hover/click or enter · esc close{s}", .{
+                    sty.gray, sty.reset }), null);
+                if (self.model_loading) {
+                    try addc(&content, &acts, try std.fmt.allocPrint(fa, "{s}loading models from provider…{s}", .{ sty.gray, sty.reset }), null);
+                } else if (self.model_error.len > 0) {
+                    try addc(&content, &acts, try std.fmt.allocPrint(fa, "{s}✗ {s}{s}", .{ sty.red, self.model_error, sty.reset }), null);
+                } else {
+                    const count = self.filteredModelCount();
+                    if (count == 0) {
+                        const empty_msg = if (self.models.len == 0) "provider returned no models" else "no matching models";
+                        try addc(&content, &acts, try std.fmt.allocPrint(fa, "{s}{s}{s}", .{ sty.gray, empty_msg, sty.reset }), null);
+                    } else {
+                        if (self.model_sel >= count) self.model_sel = 0;
+                        const max_rows = @max(1, @min(10, h -| 13));
+                        var top: usize = 0;
+                        if (count > max_rows and self.model_sel >= max_rows)
+                            top = self.model_sel - max_rows + 1;
+                        const end = @min(count, top + max_rows);
+                        for (top..end) |index| {
+                            const model = self.filteredModel(index) orelse continue;
+                            const selected = index == self.model_sel;
+                            const current = std.mem.eql(u8, model, self.model);
+                            const prefix: []const u8 = if (selected) "› " else "  ";
+                            const suffix: []const u8 = if (current) "  (current)" else "";
+                            const label = try clip(fa, model, bw -| 22);
+                            const row = try std.fmt.allocPrint(fa, "{s}{s}{s}{s}{s}{s}", .{
+                                if (selected) sty.accent ++ sty.bold else sty.gray,
+                                prefix,
+                                if (current) sty.green else sty.reset,
+                                label,
+                                sty.reset,
+                                suffix,
+                            });
+                            try addc(&content, &acts, row, .{ .select_model = model });
+                        }
+                        if (count > max_rows) {
+                            try addc(&content, &acts, try std.fmt.allocPrint(fa, "{s}{d} models · showing {d}–{d}{s}", .{
+                                sty.gray, count, top + 1, end, sty.reset }), null);
+                        } else {
+                            try addc(&content, &acts, try std.fmt.allocPrint(fa, "{s}{d} model(s) available{s}", .{
+                                sty.gray, count, sty.reset }), null);
+                        }
+                    }
+                }
+            },
         }
 
         const ch = content.items.len + 2;
         const by = if (h > ch + 4) (h - ch) / 2 else 1;
+        if (self.overlay == .model_picker) {
+            const search_col = bx + 2 + tui.displayWidth("⌕ search: ") + tui.displayWidth(self.model_filter.items[0..self.model_filter_cursor]);
+            self.overlay_cursor = .{
+                .row = @min(by + 3, h -| 1),
+                .col = @min(search_col, w -| 1),
+            };
+        }
         for (0..ch) |r| {
             const row = by + r;
             if (row >= lines.items.len) break;
@@ -1892,7 +2190,7 @@ pub const App = struct {
             "◆",
             sty.reset,
             sty.gray,
-            self.cfg.model,
+            self.model,
             sty.reset,
             sty.gray,
             try util.shortenPath(fa, self.cwd, @max(16, w / 3)),
@@ -2112,6 +2410,12 @@ pub const App = struct {
     }
 };
 
+test "model picker filter is case-insensitive" {
+    try std.testing.expect(App.modelMatches("OpenAI/Model-1", "model"));
+    try std.testing.expect(!App.modelMatches("OpenAI/Model-1", "missing"));
+    try std.testing.expect(App.modelMatches("OpenAI/Model-1", ""));
+}
+
 // ---------- worker ----------
 
 fn workerMain(app: *App) void {
@@ -2210,6 +2514,20 @@ fn workerLoop(app: *App) !void {
                 main.ag.compactNow() catch {};
                 app.q.push(.{ .status = try std.fmt.allocPrint(alloc,
                     "compacted context: {d} → {d} msgs", .{ before, main.ag.messages.items.len }) });
+            },
+            .list_models => {
+                const catalog = llm.listModels(app.hclient, alloc, app.cfg) catch |e| {
+                    app.q.push(.{ .models = .{
+                        .models = &.{},
+                        .error_msg = try std.fmt.allocPrint(alloc, "could not load provider models: {s}", .{@errorName(e)}),
+                    } });
+                    continue;
+                };
+                app.q.push(.{ .models = catalog });
+            },
+            .set_model => |model| {
+                app.cfg.model = model;
+                app.q.push(.{ .model_changed = model });
             },
             .prompt => |p| {
                 var w = workers.get(p.thread) orelse blk: {

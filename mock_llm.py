@@ -12,7 +12,8 @@ import json
 import re
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-MODEL = "mock-1"
+MODELS = ("mock-1", "mock-2", "mock-code")
+REQUESTED_MODELS = []
 
 
 def sse(obj):
@@ -107,7 +108,8 @@ class H(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path.endswith("/models"):
             body = json.dumps({"object": "list", "data": [
-                {"id": MODEL, "object": "model", "created": 0, "owned_by": "mock"}
+                {"id": model, "object": "model", "created": 0, "owned_by": "mock"}
+                for model in MODELS
             ]}).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -121,6 +123,7 @@ class H(BaseHTTPRequestHandler):
     def do_POST(self):
         n = int(self.headers.get("Content-Length", 0))
         req = json.loads(self.rfile.read(n) or b"{}")
+        REQUESTED_MODELS.append(req.get("model"))
         msgs = req.get("messages", [])
         stream = req.get("stream", False)
         kind, *rest = plan(msgs)

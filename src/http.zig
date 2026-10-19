@@ -32,16 +32,21 @@ pub const HttpClient = struct {
     ) !Response {
         var body = std.ArrayList(u8).init(alloc);
         errdefer body.deinit();
-        const res = try self.client.fetch(.{
-            .location = .{ .url = url },
-            .method = method,
-            .payload = payload,
+        var header_buf: [16 * 1024]u8 = undefined;
+        var req = try self.open(method, try std.Uri.parse(url), .{
+            .server_header_buffer = &header_buf,
+            .redirect_behavior = if (payload != null) .unhandled else @enumFromInt(3),
             .headers = .{ .content_type = .{ .override = "application/json" } },
             .extra_headers = extra_headers,
-            .response_storage = .{ .dynamic = &body },
-            .max_append_size = 128 << 20,
         });
-        return .{ .status = res.status, .body = try body.toOwnedSlice() };
+        defer req.deinit();
+        if (payload) |data| req.transfer_encoding = .{ .content_length = data.len };
+        try req.send();
+        if (payload) |data| try req.writeAll(data);
+        try req.finish();
+        try req.wait();
+        try req.reader().readAllArrayList(&body, 128 << 20);
+        return .{ .status = req.response.status, .body = try body.toOwnedSlice() };
     }
 
     /// Plain GET for arbitrary web content — no forced content-type.
@@ -54,14 +59,127 @@ pub const HttpClient = struct {
     ) !Response {
         var body = std.ArrayList(u8).init(alloc);
         errdefer body.deinit();
-        const res = try self.client.fetch(.{
-            .location = .{ .url = url },
-            .method = .GET,
+        var header_buf: [16 * 1024]u8 = undefined;
+        var req = try self.open(.GET, try std.Uri.parse(url), .{
+            .server_header_buffer = &header_buf,
             .extra_headers = extra_headers,
-            .response_storage = .{ .dynamic = &body },
-            .max_append_size = max_bytes,
         });
-        return .{ .status = res.status, .body = try body.toOwnedSlice() };
+        defer req.deinit();
+        try req.send();
+        try req.finish();
+        try req.wait();
+        try req.reader().readAllArrayList(&body, max_bytes);
+        return .{ .status = req.response.status, .body = try body.toOwnedSlice() };
+    }
+
+    pub fn open(
+        self: *HttpClient,
+        method: std.http.Method,
+        uri: std.Uri,
+        options: std.http.Client.RequestOptions,
+    ) !std.http.Client.Request {
+        const scheme = uri.scheme;
+        const protocol: std.http.Client.Connection.Protocol = if (std.ascii.eqlIgnoreCase(scheme, "https"))
+            .tls
+        else if (std.ascii.eqlIgnoreCase(scheme, "http"))
+            .plain
+        else
+            return error.UnsupportedScheme;
+        const proxy = if (protocol == .tls) self.client.https_proxy else self.client.http_proxy;
+        if (proxy != null) return self.client.open(method, uri, options);
+
+        const host = try (uri.host orelse return error.UriMissingHost).toRawMaybeAlloc(self.client.allocator);
+        const port = uri.port orelse if (protocol == .tls) @as(u16, 443) else 80;
+        const criteria = std.http.Client.ConnectionPool.Criteria{ .host = host, .port = port, .protocol = protocol };
+        if (self.client.connection_pool.findConnection(criteria)) |connection| {
+            var options_with_connection = options;
+            options_with_connection.connection = connection;
+            return self.client.open(method, uri, options_with_connection) catch |err| {
+                self.client.connection_pool.release(self.client.allocator, connection);
+                return err;
+            };
+        }
+
+        if (protocol == .tls) try self.ensureCertificates();
+        const connection = try self.connectHostV4First(host, port, protocol);
+        var options_with_connection = options;
+        options_with_connection.connection = connection;
+        return self.client.open(method, uri, options_with_connection) catch |err| {
+            self.client.connection_pool.release(self.client.allocator, connection);
+            return err;
+        };
+    }
+
+    fn ensureCertificates(self: *HttpClient) !void {
+        if (std.http.Client.disable_tls or !@atomicLoad(bool, &self.client.next_https_rescan_certs, .acquire)) return;
+        self.client.ca_bundle_mutex.lock();
+        defer self.client.ca_bundle_mutex.unlock();
+        if (!self.client.next_https_rescan_certs) return;
+        try self.client.ca_bundle.rescan(self.client.allocator);
+        @atomicStore(bool, &self.client.next_https_rescan_certs, false, .release);
+    }
+
+    fn connectHostV4First(
+        self: *HttpClient,
+        host: []const u8,
+        port: u16,
+        protocol: std.http.Client.Connection.Protocol,
+    ) !*std.http.Client.Connection {
+        const alloc = self.client.allocator;
+        var addresses = try std.net.getAddressList(alloc, host, port);
+        defer addresses.deinit();
+        if (addresses.addrs.len == 0) return error.UnknownHostName;
+
+        var last_error: anyerror = error.ConnectionRefused;
+        for (0..2) |pass| {
+            for (addresses.addrs) |address| {
+                const is_v4 = address.any.family == std.posix.AF.INET;
+                if ((pass == 0) != is_v4) continue;
+                const stream = std.net.tcpConnectToAddress(address) catch |err| {
+                    last_error = err;
+                    continue;
+                };
+                return try self.registerConnection(stream, host, port, protocol);
+            }
+        }
+        return last_error;
+    }
+
+    fn registerConnection(
+        self: *HttpClient,
+        stream: std.net.Stream,
+        host: []const u8,
+        port: u16,
+        protocol: std.http.Client.Connection.Protocol,
+    ) !*std.http.Client.Connection {
+        const alloc = self.client.allocator;
+        const node = try alloc.create(std.http.Client.ConnectionPool.Node);
+        errdefer alloc.destroy(node);
+        node.* = .{ .data = undefined };
+        errdefer stream.close();
+        node.data = .{
+            .stream = stream,
+            .tls_client = undefined,
+            .protocol = protocol,
+            .host = try alloc.dupe(u8, host),
+            .port = port,
+        };
+        errdefer alloc.free(node.data.host);
+
+        if (protocol == .tls) {
+            if (std.http.Client.disable_tls) return error.TlsInitializationFailed;
+            node.data.tls_client = try alloc.create(std.crypto.tls.Client);
+            errdefer alloc.destroy(node.data.tls_client);
+            node.data.tls_client.* = try std.crypto.tls.Client.init(stream, .{
+                .host = .{ .explicit = host },
+                .ca = .{ .bundle = self.client.ca_bundle },
+                .ssl_key_log_file = null,
+            });
+            node.data.tls_client.allow_truncation_attacks = true;
+        }
+
+        self.client.connection_pool.addUsed(node);
+        return &node.data;
     }
 };
 
@@ -83,7 +201,7 @@ pub fn postSse(
 ) !std.http.Status {
     const uri = try std.Uri.parse(url);
     var hdr_buf: [32 * 1024]u8 = undefined;
-    var req = try http.client.open(.POST, uri, .{
+    var req = try http.open(.POST, uri, .{
         .server_header_buffer = &hdr_buf,
         .headers = .{ .content_type = .{ .override = "application/json" } },
         .extra_headers = extra_headers,

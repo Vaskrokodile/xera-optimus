@@ -41,7 +41,9 @@ or with `--classic`):
 Slash commands: `/help` `/exit` `/clear` `/auto` `/model` `/usage`
 (token counters) `/summarize` (compact now) `/skills` `/agents`
 `/harness` (components + validation problems) `/library` `/sessions`
-`/resume <id>` `/status` `/improve`.
+`/resume <id>` `/status` `/improve`. `/model` opens a searchable model picker
+for the currently configured provider; navigate with arrows/Enter or hover and
+click a model. Use config (`base_url`, API key) to change providers.
 
 ## Multiplayer
 

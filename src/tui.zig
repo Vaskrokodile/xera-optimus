@@ -26,7 +26,7 @@ pub const Key = union(enum) {
     resize,
     paste: []const u8, // bracketed-paste payload (caller owns until handled)
     /// 0-based terminal cell coords; btn: 0=left,1=middle,2=right
-    mouse: struct { col: u16, row: u16, btn: u8, down: bool },
+    mouse: struct { col: u16, row: u16, btn: u8, down: bool, move: bool = false },
 };
 
 pub const Term = struct {
@@ -78,7 +78,7 @@ pub const Term = struct {
             raw.cc[@intFromEnum(std.posix.V.TIME)] = 0;
             try std.posix.tcsetattr(fd, .FLUSH, raw);
         }
-        t.out.writeAll("\x1b[?1049h\x1b[?2004h\x1b[?25l\x1b[?1000h\x1b[?1006h") catch {};
+        t.out.writeAll("\x1b[?1049h\x1b[?2004h\x1b[?25l\x1b[?1003h\x1b[?1006h") catch {};
         t.active = true;
         try t.querySize();
         return t;
@@ -86,7 +86,7 @@ pub const Term = struct {
 
     pub fn leave(self: *Term) void {
         if (!self.active) return;
-        self.out.writeAll("\x1b[?1000l\x1b[?2004l\x1b[?25h\x1b[?1049l") catch {};
+        self.out.writeAll("\x1b[?1003l\x1b[?2004l\x1b[?25h\x1b[?1049l") catch {};
         if (win) {
             const hin = std.os.windows.kernel32.GetStdHandle(std.os.windows.STD_INPUT_HANDLE).?;
             const hout = std.os.windows.kernel32.GetStdHandle(std.os.windows.STD_OUTPUT_HANDLE).?;
@@ -148,6 +148,11 @@ pub const Term = struct {
                         } else {
                             try keys.append(.{ .mouse = .{ .col = col, .row = row, .btn = 0, .down = false } });
                         }
+                    } else if (flags == 1) { // MOUSE_MOVED
+                        const col: u16 = @intCast(m.dwMousePosition & 0xFFFF);
+                        const row: u16 = @intCast((m.dwMousePosition >> 16) & 0xFFFF);
+                        const btn: u8 = if ((m.dwButtonState & 0x2) != 0) 2 else if ((m.dwButtonState & 0x4) != 0) 1 else 0;
+                        try keys.append(.{ .mouse = .{ .col = col, .row = row, .btn = btn, .down = false, .move = true } });
                     } else if (flags == 4) { // MOUSE_WHEELED
                         // wheel up = positive delta in high word
                         const delta: i16 = @bitCast(@as(u16, @intCast((m.dwButtonState >> 16) & 0xFFFF)));
@@ -271,7 +276,8 @@ pub const Term = struct {
                                     .col = @intCast(@max(1, nums[1]) - 1),
                                     .row = @intCast(@max(1, nums[2]) - 1),
                                     .btn = btn,
-                                    .down = fin == 'M',
+                                    .down = fin == 'M' and (btn_code & 32) == 0,
+                                    .move = (btn_code & 32) != 0,
                                 } });
                             } else {
                                 try keys.append(if ((btn_code & 1) == 0) .page_up else .page_down);
@@ -545,6 +551,15 @@ pub fn wrapLine(alloc: std.mem.Allocator, line: []const u8, width: usize) !std.A
     }
     try out.append(cur.items);
     return out;
+}
+
+test "wrapLine handles a space at the width boundary" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const wrapped = try wrapLine(arena.allocator(), "hello world", 5);
+    try std.testing.expectEqual(@as(usize, 2), wrapped.items.len);
+    try std.testing.expectEqualStrings("hello", wrapped.items[0]);
+    try std.testing.expectEqualStrings("world", wrapped.items[1]);
 }
 
 /// Wrap all lines of a block (split on \n) to width.

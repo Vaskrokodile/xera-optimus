@@ -124,6 +124,70 @@ fn authHeaders(alloc: std.mem.Allocator, cfg: *const config.Config) ![]http.Head
     return list.toOwnedSlice();
 }
 
+pub const ModelCatalog = struct {
+    models: [][]const u8,
+    error_msg: []const u8 = "",
+};
+
+/// Fetch model ids from the configured OpenAI-compatible provider.
+pub fn listModels(
+    h: *http.HttpClient,
+    alloc: std.mem.Allocator,
+    cfg: *const config.Config,
+) !ModelCatalog {
+    const url = try std.fmt.allocPrint(alloc, "{s}/models", .{cfg.base_url});
+    var res = try h.fetchUrl(alloc, url, &.{}, 8 << 20);
+    if (res.status == .unauthorized or res.status == .forbidden) {
+        const headers = try authHeaders(alloc, cfg);
+        res = try h.fetchUrl(alloc, url, headers, 8 << 20);
+    }
+    if (res.status != .ok) {
+        return .{
+            .models = &.{},
+            .error_msg = try std.fmt.allocPrint(alloc, "provider returned HTTP {s}", .{@tagName(res.status)}),
+        };
+    }
+    return .{ .models = try parseModelIds(alloc, res.body) };
+}
+
+pub fn parseModelIds(alloc: std.mem.Allocator, body: []const u8) ![][]const u8 {
+    const root = try util.jparse(alloc, body);
+    const items = util.jget(root, "data") orelse util.jget(root, "models") orelse
+        return error.InvalidModelList;
+    if (items != .array) return error.InvalidModelList;
+    var models = std.ArrayList([]const u8).init(alloc);
+    var seen = std.StringHashMap(void).init(alloc);
+    for (items.array.items) |item| {
+        const id = if (item == .string)
+            item.string
+        else
+            util.jstr(item, "id") orelse util.jstr(item, "name") orelse continue;
+        if (id.len == 0 or id.len > 256 or seen.contains(id)) continue;
+        var unsafe = false;
+        for (id) |c| {
+            if (c < 0x20 or c == 0x7f) {
+                unsafe = true;
+                break;
+            }
+        }
+        if (unsafe) continue;
+        const owned = try alloc.dupe(u8, id);
+        try models.append(owned);
+        try seen.put(owned, {});
+    }
+    return models.toOwnedSlice();
+}
+
+test "parse OpenAI-compatible model ids" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const ids = try parseModelIds(arena.allocator(),
+        "{\"data\":[{\"id\":\"alpha\"},{\"id\":\"beta\"},{\"id\":\"alpha\"},{\"id\":\"\"}]}");
+    try std.testing.expectEqual(@as(usize, 2), ids.len);
+    try std.testing.expectEqualStrings("alpha", ids[0]);
+    try std.testing.expectEqualStrings("beta", ids[1]);
+}
+
 pub fn chat(
     h: *http.HttpClient,
     alloc: std.mem.Allocator,

@@ -132,8 +132,17 @@ def show(scr, label):
 
 def main():
     scenario = sys.argv[1] if len(sys.argv) > 1 else "basic"
+    mock_server = None
+    model_test_error = None
+    if scenario == "model":
+        from http.server import HTTPServer
+        from mock_llm import H, REQUESTED_MODELS
+
+        mock_server = HTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=mock_server.serve_forever, daemon=True).start()
+        os.environ["XERA_TEST_BASE_URL"] = f"http://127.0.0.1:{mock_server.server_port}/v1"
     os.environ.update({
-        "XERA_BASE_URL": "http://127.0.0.1:8787/v1",
+        "XERA_BASE_URL": os.environ.get("XERA_TEST_BASE_URL", "http://127.0.0.1:8787/v1"),
         "XERA_API_KEY": "mock",
         "XERA_MODEL": "mock-1",
     })
@@ -170,6 +179,26 @@ def main():
         pty.write("y")
         scr.feed(read_all(pty, 4.0))
         show(scr, "after approve")
+
+    if scenario == "model":
+        pty.write("/model")
+        scr.feed(read_all(pty, 0.4))
+        pty.write("\r")
+        scr.feed(read_all(pty, 1.0))
+        show(scr, "model picker loaded")
+        pty.write("mock-code")
+        scr.feed(read_all(pty, 0.5))
+        show(scr, "model picker filtered")
+        pty.write("\r")
+        scr.feed(read_all(pty, 1.0))
+        show(scr, "model selected")
+        pty.write("hello after model switch\r")
+        scr.feed(read_all(pty, 2.0))
+        show(scr, "prompt uses selected model")
+        if not REQUESTED_MODELS or REQUESTED_MODELS[-1] != "mock-code":
+            model_test_error = f"completion used {REQUESTED_MODELS[-1] if REQUESTED_MODELS else 'no model'}, expected mock-code"
+        else:
+            log("[verified request model: mock-code]")
 
     if scenario == "slash":
         # '/' opens the dropdown
@@ -211,6 +240,11 @@ def main():
     if pty.isalive():
         import signal
         os.kill(pty.pid, signal.SIGTERM)
+    if mock_server is not None:
+        mock_server.shutdown()
+        mock_server.server_close()
+    if model_test_error is not None:
+        raise AssertionError(model_test_error)
 
 
 if __name__ == "__main__":
