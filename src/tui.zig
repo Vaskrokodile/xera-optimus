@@ -514,14 +514,25 @@ pub fn wrapLine(alloc: std.mem.Allocator, line: []const u8, width: usize) !std.A
         if (c == ' ') last_space = cur.items.len;
         if (cur_w + cw > width and cur.items.len > 0) {
             if (last_space) |sp| {
-                // break at the space
-                try out.append(try alloc.dupe(u8, cur.items[0..sp]));
-                const rest = cur.items[sp + 1 ..];
-                var ncur = std.ArrayList(u8).init(alloc);
-                try ncur.appendSlice(rest);
-                cur = ncur;
-                cur_w = displayWidth(rest);
-                last_space = null;
+                if (sp < cur.items.len) {
+                    // break at the space
+                    try out.append(try alloc.dupe(u8, cur.items[0..sp]));
+                    const rest = cur.items[sp + 1 ..];
+                    var ncur = std.ArrayList(u8).init(alloc);
+                    try ncur.appendSlice(rest);
+                    cur = ncur;
+                    cur_w = displayWidth(rest);
+                    last_space = std.mem.lastIndexOfScalar(u8, cur.items, ' ');
+                } else {
+                    // sp == cur.items.len: the space that triggered this wrap
+                    // hasn't been appended yet — it is the break point.
+                    try out.append(try alloc.dupe(u8, cur.items));
+                    cur.clearRetainingCapacity();
+                    cur_w = 0;
+                    last_space = null;
+                    i += len;
+                    continue;
+                }
             } else {
                 try out.append(try alloc.dupe(u8, cur.items));
                 cur.clearRetainingCapacity();
