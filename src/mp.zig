@@ -325,7 +325,10 @@ pub const Client = struct {
                 if (buf.items.len > MAX_LINE) buf.clearRetainingCapacity();
             }
         }
-        if (self.cbs.on_close) |f| f(self.cbs.ctx, "connection lost");
+        // only report an unexpected drop — close() sets alive=false first
+        if (self.alive.swap(false, .acq_rel)) {
+            if (self.cbs.on_close) |f| f(self.cbs.ctx, "connection lost");
+        }
     }
 };
 

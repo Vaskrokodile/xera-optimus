@@ -126,7 +126,10 @@ pub fn main() !u8 {
     util.setupConsole();
     var arena_inst = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena_inst.deinit();
-    const alloc = arena_inst.allocator();
+    // Sockets, agent workers and the UI all allocate concurrently — the
+    // arena itself isn't thread-safe, so serialize access behind a mutex.
+    var ts_alloc: std.heap.ThreadSafeAllocator = .{ .child_allocator = arena_inst.allocator() };
+    const alloc = ts_alloc.allocator();
 
     const argv = try std.process.argsAlloc(alloc);
     const args = if (argv.len > 1) argv[1..] else &[_][]const u8{};
