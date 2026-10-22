@@ -29,6 +29,9 @@ pub const Key = union(enum) {
     mouse: struct { col: u16, row: u16, btn: u8, down: bool, move: bool = false },
 };
 
+/// ESC-sequence parser state for VT input (Windows delivers bytes, not keys).
+pub const InputState = enum { ground, esc, csi, ss3, x10, paste, paste_esc, paste_csi };
+
 pub const Term = struct {
     in: std.fs.File,
     out: std.fs.File,
@@ -40,11 +43,22 @@ pub const Term = struct {
     saved_out_mode: u32 = 0,
     old_termios: ?SavedTermios = null,
 
+    // VT input parsing. Windows hands us ESC sequences as ordinary key
+    // events, so bytes are reassembled here instead of inserted as text.
+    state: InputState = .ground,
+    seq: [32]u8 = undefined,
+    seq_len: usize = 0,
+    x10: [3]u8 = undefined,
+    x10_need: u8 = 0,
+    paste_buf: std.ArrayList(u8) = undefined,
+    paste_alloc: std.mem.Allocator = undefined,
+
     // ---------- lifecycle ----------
 
     pub fn enter(alloc: std.mem.Allocator) !Term {
-        _ = alloc;
         var t = Term{ .in = std.io.getStdIn(), .out = std.io.getStdOut() };
+        t.paste_alloc = alloc;
+        t.paste_buf = std.ArrayList(u8).init(alloc);
         if (win) {
             const hin = std.os.windows.kernel32.GetStdHandle(std.os.windows.STD_INPUT_HANDLE).?;
             const hout = std.os.windows.kernel32.GetStdHandle(std.os.windows.STD_OUTPUT_HANDLE).?;
@@ -124,7 +138,6 @@ pub const Term = struct {
     }
 
     fn pollKeysWin(self: *Term, alloc: std.mem.Allocator, keys: *std.ArrayList(Key), wait_ms: u32) !void {
-        _ = self;
         _ = alloc;
         const hin = std.os.windows.kernel32.GetStdHandle(std.os.windows.STD_INPUT_HANDLE).?;
         std.os.windows.WaitForSingleObject(hin, wait_ms) catch return; // timeout => no input
@@ -167,14 +180,24 @@ pub const Term = struct {
                     const k = rec.Event.KeyEvent;
                     if (k.bKeyDown == 0) continue;
                     const ctrl = (k.dwControlKeyState & 0x000C) != 0; // left|right ctrl
-                    // printable chars
-                    if (k.UnicodeChar >= 0x20 and k.UnicodeChar != 0x7f) {
-                        try keys.append(.{ .char = @intCast(k.UnicodeChar) });
+                    const uc: u32 = k.UnicodeChar;
+                    // Printable characters. With ENABLE_VIRTUAL_TERMINAL_INPUT the
+                    // console delivers escape sequences (mouse reports, focus events,
+                    // CSI arrow keys) here too, so they are reassembled by feedByte()
+                    // instead of being inserted into the composer as literal text.
+                    if (uc >= 0x20 and uc != 0x7f) {
+                        try self.feedByte(keys, @intCast(uc));
+                        continue;
+                    }
+                    // Inside a bracketed paste every byte is literal text,
+                    // including newlines and ESC — route it to the parser.
+                    if (self.state == .paste or self.state == .paste_esc or self.state == .paste_csi) {
+                        try self.feedByte(keys, @intCast(uc & 0xFF));
                         continue;
                     }
                     // control chars: real keys AND PTY-injected input both
                     // carry UnicodeChar (vk may be 0 for injected input)
-                    switch (k.UnicodeChar) {
+                    switch (uc) {
                         0x0D => {
                             try keys.append(.enter);
                             continue;
@@ -197,7 +220,7 @@ pub const Term = struct {
                             continue;
                         },
                         0x1B => {
-                            try keys.append(.escape);
+                            try self.feedByte(keys, 0x1b);
                             continue;
                         },
                         0x09 => {
@@ -232,6 +255,234 @@ pub const Term = struct {
                 },
                 else => {},
             }
+        }
+        // A sequence still open here was truncated by the console (or the
+        // window closed). Never leak its bytes into the composer.
+        if (self.state == .csi and self.seq_len > 0) {
+            try self.emitCsiBody(keys, 0, false);
+        }
+        self.state = .ground;
+        self.seq_len = 0;
+    }
+
+    /// Reassemble VT sequences byte by byte. With ENABLE_VIRTUAL_TERMINAL_INPUT
+    /// the Windows console delivers every escape byte as a KEY_EVENT, so without
+    /// this the bytes land in the composer as literal junk like "[<35;40;10M".
+    fn feedByte(self: *Term, keys: *std.ArrayList(Key), b: u8) !void {
+        switch (self.state) {
+            .ground => {
+                if (b == 0x1b) {
+                    self.state = .esc;
+                } else {
+                    try keys.append(.{ .char = b });
+                }
+            },
+
+            // ESC seen: decide what kind of sequence this is
+            .esc => {
+                if (b == '[') {
+                    self.state = .csi;
+                    self.seq_len = 0;
+                } else if (b == 'O') {
+                    self.state = .ss3;
+                } else {
+                    // bare ESC followed by an ordinary key
+                    self.state = .ground;
+                    try keys.append(.escape);
+                    try self.feedByte(keys, b);
+                }
+            },
+
+            .ss3 => {
+                self.state = .ground;
+                try self.emitFinal(keys, b);
+            },
+
+            .csi => {
+                // ESC [ M is the classic X10 mouse: 3 raw bytes follow
+                if (b == 'M' and self.seq_len == 0) {
+                    self.state = .x10;
+                    self.x10_need = 3;
+                    return;
+                }
+                const final = b >= 0x40 and b <= 0x7e; // VT: final byte range
+                if (!final) {
+                    // parameter or intermediate byte
+                    if (self.seq_len < self.seq.len) {
+                        self.seq[self.seq_len] = b;
+                        self.seq_len += 1;
+                    }
+                    return;
+                }
+                // complete CSI
+                self.state = .ground;
+                try self.emitCsiBody(keys, b, false);
+            },
+
+            .x10 => {
+                const idx: usize = 3 - self.x10_need;
+                if (idx < 3) self.x10[idx] = b;
+                self.x10_need -= 1;
+                if (self.x10_need == 0) {
+                    self.state = .ground;
+                    try self.emitX10(keys);
+                }
+            },
+
+            // ---- bracketed paste: body is raw text until ESC[201~ ----
+            .paste => {
+                if (b == 0x1b) {
+                    self.state = .paste_esc;
+                } else {
+                    try self.paste_buf.append(b);
+                }
+            },
+
+            .paste_esc => {
+                if (b == '[') {
+                    self.state = .paste_csi;
+                    self.seq_len = 0;
+                } else {
+                    try self.paste_buf.append(0x1b);
+                    try self.paste_buf.append(b);
+                    self.state = .paste;
+                }
+            },
+
+            .paste_csi => {
+                const final = b >= 0x40 and b <= 0x7e; // VT: final byte range
+                if (!final) {
+                    if (self.seq_len < self.seq.len) {
+                        self.seq[self.seq_len] = b;
+                        self.seq_len += 1;
+                    }
+                    return;
+                }
+                const pp = self.seq[0..self.seq_len];
+                if (b == '~' and std.mem.eql(u8, pp, "201")) {
+                    // end of paste — hand the text over as one key
+                    self.state = .ground;
+                    self.seq_len = 0;
+                    if (self.paste_buf.items.len > 0) {
+                        try keys.append(.{ .paste = try self.paste_buf.toOwnedSlice() });
+                        self.paste_buf = std.ArrayList(u8).init(self.paste_alloc);
+                    }
+                } else {
+                    // some other sequence inside the pasted text: keep it literal
+                    try self.paste_buf.appendSlice("\x1b[");
+                    try self.paste_buf.appendSlice(pp);
+                    try self.paste_buf.append(b);
+                    self.state = .paste;
+                    self.seq_len = 0;
+                }
+            },
+        }
+    }
+
+    fn emitX10(self: *Term, keys: *std.ArrayList(Key)) !void {
+        const cb = self.x10[0];
+        if ((cb & 64) != 0) {
+            try keys.append(if ((cb & 1) == 0) .page_up else .page_down);
+            return;
+        }
+        try keys.append(.{ .mouse = .{
+            .col = @intCast(@max(1, @as(u32, self.x10[1])) - 32),
+            .row = @intCast(@max(1, @as(u32, self.x10[2])) - 32),
+            .btn = @intCast(cb & 3),
+            .down = (cb & 3) != 3,
+        } });
+    }
+
+    /// A complete CSI: self.seq holds the parameter bytes, `fin` is the final byte.
+    fn emitCsiBody(self: *Term, keys: *std.ArrayList(Key), fin: u8, in_paste: bool) !void {
+        const p = self.seq[0..self.seq_len];
+
+        // bracketed paste delimiters
+        if (fin == '~' and std.mem.eql(u8, p, "200")) {
+            self.state = .paste;
+            self.paste_buf.clearRetainingCapacity();
+            return;
+        }
+        if (fin == '~' and std.mem.eql(u8, p, "201")) {
+            if (self.paste_buf.items.len > 0) {
+                try keys.append(.{ .paste = try self.paste_buf.toOwnedSlice() });
+                self.paste_buf = std.ArrayList(u8).init(self.paste_buf.allocator);
+            }
+            self.state = .ground;
+            return;
+        }
+        // from inside a paste, any other sequence is literal text
+        if (in_paste) {
+            try self.paste_buf.appendSlice("\x1b[");
+            try self.paste_buf.appendSlice(p);
+            try self.paste_buf.append(fin);
+            self.state = .paste;
+            return;
+        }
+
+        if (p.len > 0 and p[0] == '<') {
+            // SGR mouse: ESC[<Cb;Cx;Cy(M|m)
+            if (fin != 'M' and fin != 'm') return;
+            var nums = [3]u32{ 0, 0, 0 };
+            var ni: usize = 0;
+            for (p[1..]) |d| {
+                if (d >= '0' and d <= '9') {
+                    if (ni < 3) nums[ni] = nums[ni] * 10 + (d - '0');
+                } else if (d == ';') {
+                    ni += 1;
+                }
+            }
+            const btn_code = nums[0];
+            if ((btn_code & 64) != 0) { // wheel
+                const up = (btn_code & 1) == 0;
+                keys.append(if (up) .page_up else .page_down) catch {};
+                return;
+            }
+            keys.append(.{ .mouse = .{
+                .col = @intCast(@max(1, nums[1]) - 1),
+                .row = @intCast(@max(1, nums[2]) - 1),
+                .btn = @intCast(btn_code & 3),
+                .down = fin == 'M' and (btn_code & 32) == 0,
+                .move = (btn_code & 32) != 0,
+            } }) catch {};
+            return;
+        }
+
+        // private / device reports (ESC[?.., ESC[>..): consume silently.
+        // These are the replies a terminal sends for the query sequences the
+        // app emits on startup, e.g. ESC[?1;2$y or ESC[>0;276;0c.
+        if (p.len > 0 and (p[0] == '?' or p[0] == '>' or p[0] == '=')) return;
+
+        if (fin == '~') {
+            var num: u32 = 0;
+            for (p) |d| {
+                if (d >= '0' and d <= '9') num = num * 10 + (d - '0') else break;
+            }
+            switch (num) {
+                1, 7 => keys.append(.home) catch {},
+                3 => keys.append(.delete) catch {},
+                4, 8 => keys.append(.end) catch {},
+                5 => keys.append(.page_up) catch {},
+                6 => keys.append(.page_down) catch {},
+                else => {}, // F-keys, modifyOtherKeys, etc.
+            }
+            return;
+        }
+        try self.emitFinal(keys, fin);
+    }
+
+    /// Map a final byte to a key.
+    fn emitFinal(self: *Term, keys: *std.ArrayList(Key), fin: u8) !void {
+        _ = self;
+        switch (fin) {
+            'A' => try keys.append(.up),
+            'B' => try keys.append(.down),
+            'C' => try keys.append(.right),
+            'D' => try keys.append(.left),
+            'H' => try keys.append(.home),
+            'F' => try keys.append(.end),
+            // focus in/out (ESC[I / ESC[O) and everything else: not a key
+            else => {},
         }
     }
 

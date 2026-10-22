@@ -827,7 +827,11 @@ pub const App = struct {
         var i: usize = 0;
         while (i < text.len) {
             const c = text[i];
+            // keep every line break: a paste must not silently join lines
             if (c == '\r') {
+                if (i + 1 < text.len and text[i + 1] == '\n') i += 1; // CRLF -> LF
+                try self.composer.insertSlice(self.cursor, "\n");
+                self.cursor += 1;
                 i += 1;
                 continue;
             }
