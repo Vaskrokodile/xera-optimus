@@ -274,8 +274,22 @@ pub const Client = struct {
         wsaInit();
         var idbuf: [160]u8 = undefined;
         const parsed = try parseSessionId(&idbuf, session_id);
-        const addr = try std.net.Address.parseIp(parsed.ip, parsed.port);
-        const stream = try std.net.tcpConnectToAddress(addr);
+        var stream: std.net.Stream = undefined;
+        if (std.net.Address.parseIp(parsed.ip, parsed.port)) |addr| {
+            stream = try std.net.tcpConnectToAddress(addr);
+        } else |_| {
+            // not a literal IP — resolve it (tunnel endpoints, DDNS, LAN
+            // names) and try each answer: "localhost" may give ::1 first
+            // while we only listen on IPv4.
+            const list = try std.net.getAddressList(alloc, parsed.ip, parsed.port);
+            var connected = false;
+            for (list.addrs) |a| {
+                stream = std.net.tcpConnectToAddress(a) catch continue;
+                connected = true;
+                break;
+            }
+            if (!connected) return error.ConnectionRefused;
+        }
         setNonBlocking(stream);
         const self = try alloc.create(Client);
         self.* = .{
@@ -421,13 +435,29 @@ pub fn parseSessionId(buf: []u8, s0: []const u8) !SessionId {
     return .{ .ip = ip, .port = port, .key = key };
 }
 
+pub const MadeId = struct { id: []const u8, key: []const u8 };
+
 /// Make a session id for `port` — detects the LAN ip via a UDP connect
-/// (no packets actually leave) and picks a random key.
-pub fn makeSessionId(alloc: std.mem.Allocator, port: u16) ![]const u8 {
-    const ip = localIp(alloc) catch "127.0.0.1";
+/// (no packets actually leave) unless `advertise` overrides it, and
+/// picks a random key. `advertise` may include a port (`host:port`),
+/// for NAT/tunnel endpoints whose public port differs from ours.
+pub fn makeSessionId(alloc: std.mem.Allocator, port: u16, advertise: ?[]const u8) !MadeId {
+    var host: []const u8 = undefined;
+    var adv_port = port;
+    if (advertise) |a| {
+        host = a;
+        if (std.mem.lastIndexOfScalar(u8, a, ':')) |ci| {
+            if (std.fmt.parseInt(u16, a[ci + 1 ..], 10)) |p| {
+                host = a[0..ci];
+                adv_port = p;
+            } else |_| {}
+        }
+    } else {
+        host = localIp(alloc) catch "127.0.0.1";
+    }
     var rng = std.Random.DefaultPrng.init(@intCast(std.time.microTimestamp()));
     const key = try std.fmt.allocPrint(alloc, "{x:0>6}", .{rng.random().int(u24)});
-    return std.fmt.allocPrint(alloc, "xmp-{s}-{d}-{s}", .{ ip, port, key });
+    return .{ .id = try std.fmt.allocPrint(alloc, "xmp-{s}-{d}-{s}", .{ host, adv_port, key }), .key = key };
 }
 
 const TestSink = struct {

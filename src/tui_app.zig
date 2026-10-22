@@ -165,7 +165,7 @@ const slash_cmds = [_]SlashCmd{
     .{ .name = "/library", .desc = "adopted harness snapshots" },
     .{ .name = "/main", .desc = "return to the shared channel" },
     .{ .name = "/model", .desc = "search and switch provider model" },
-    .{ .name = "/multiplayer-create", .desc = "host a multiplayer session" },
+    .{ .name = "/multiplayer-create", .desc = "host a session: /multiplayer-create [public-ip|host[:port]]" },
     .{ .name = "/multiplayer-join", .desc = "join: /multiplayer-join <xmp-id>", .takes_arg = true },
     .{ .name = "/resume", .desc = "load a session: /resume <id>", .takes_arg = true },
     .{ .name = "/sessions", .desc = "list saved sessions" },
@@ -1213,7 +1213,7 @@ pub const App = struct {
         } else if (std.mem.eql(u8, name, "/improve")) {
             try self.addSys("improve runs as its own command:  xera-optimus improve \"task\"");
         } else if (std.mem.eql(u8, name, "/multiplayer-create")) {
-            try self.mpCreate();
+            try self.mpCreate(arg);
         } else if (std.mem.eql(u8, name, "/multiplayer-join") or std.mem.eql(u8, name, "/join")) {
             if (arg.len == 0) {
                 try self.addSys("usage: /multiplayer-join <xmp-ip-port-key>");
@@ -1240,7 +1240,7 @@ pub const App = struct {
 
     // ---------- multiplayer ----------
 
-    fn mpCreate(self: *App) !void {
+    fn mpCreate(self: *App, adv_arg: []const u8) !void {
         if (self.mp_mode != .none) {
             try self.addSysFmt("already in a session ({s})", .{self.mp_id});
             return;
@@ -1256,9 +1256,16 @@ pub const App = struct {
         };
         self.mp_server = srv;
         self.mp_mode = .host;
-        self.mp_id = mp.makeSessionId(self.alloc, srv.port) catch "xmp-?";
-        const key_start = std.mem.lastIndexOfScalar(u8, self.mp_id, '-').? + 1;
-        self.mp_key = self.mp_id[key_start..];
+        // optional arg/env: the address peers should dial (public ip,
+        // VPN ip, or tunnel host[:port] — defaults to auto-detected LAN)
+        const advertise: ?[]const u8 = if (adv_arg.len > 0) adv_arg else
+            (util.getenv(self.alloc, "XERA_ADVERTISE") orelse util.getenv(self.alloc, "XERA_PUBLIC_IP"));
+        const made = mp.makeSessionId(self.alloc, srv.port, advertise) catch {
+            try self.addSys("✗ could not build session id");
+            return;
+        };
+        self.mp_id = made.id;
+        self.mp_key = made.key;
         try self.addSysFmt("⬡ multiplayer session live — share this id:", .{});
         try self.addSysFmt("  {s}{s}{s}", .{ sty.accent ++ sty.bold, self.mp_id, sty.reset });
         try self.addSys("  peers run:  xera-optimus  →  /multiplayer-join <id>");
