@@ -272,7 +272,8 @@ pub const Client = struct {
     /// session_id like `xmp-<ip>-<port>-<key>`; name sent in the join message.
     pub fn connect(alloc: std.mem.Allocator, session_id: []const u8, name: []const u8, cbs: Cbs) !*Client {
         wsaInit();
-        const parsed = try parseSessionId(session_id);
+        var idbuf: [160]u8 = undefined;
+        const parsed = try parseSessionId(&idbuf, session_id);
         const addr = try std.net.Address.parseIp(parsed.ip, parsed.port);
         const stream = try std.net.tcpConnectToAddress(addr);
         setNonBlocking(stream);
@@ -336,14 +337,83 @@ pub const Client = struct {
 
 pub const SessionId = struct { ip: []const u8, port: u16, key: []const u8 };
 
-/// `xmp-<ip>-<port>-<key>`
-pub fn parseSessionId(s0: []const u8) !SessionId {
+/// `xmp-<ip>-<port>-<key>` — `buf` receives the sanitized id; the
+/// returned fields are slices into it. Copied ids pick up unicode
+/// dashes, NBSP/ZWSP and line-wrap whitespace from chat apps, so all
+/// of that is normalized away before splitting.
+pub fn parseSessionId(buf: []u8, s0: []const u8) !SessionId {
     var s = std.mem.trim(u8, s0, " \t\r\n");
     if (!std.mem.startsWith(u8, s, "xmp-")) return error.BadSessionId;
     s = s[4..];
-    const first = std.mem.indexOfScalar(u8, s, '-') orelse return error.BadSessionId;
-    const ip = s[0..first];
-    const rest = s[first + 1 ..];
+    // Undo latin-1 mojibake: somewhere upstream a UTF-8 id was decoded
+    // as code-page chars, so one char now stands for each original byte
+    // ("â–" for "–", "Â " for NBSP). Fold every codepoint ≤0xFF back to
+    // its byte so the real UTF-8 is recovered; genuine non-ASCII keeps
+    // its bytes.
+    var raw: [320]u8 = undefined;
+    var rn: usize = 0;
+    var ri: usize = 0;
+    while (ri < s.len and rn < raw.len) {
+        const c = s[ri];
+        if (c < 0x80) {
+            raw[rn] = c;
+            rn += 1;
+            ri += 1;
+            continue;
+        }
+        const l = std.unicode.utf8ByteSequenceLength(c) catch 1;
+        if (ri + l > s.len) break;
+        const cp = std.unicode.utf8Decode(s[ri .. ri + l]) catch {
+            raw[rn] = c;
+            rn += 1;
+            ri += 1;
+            continue;
+        };
+        if (cp <= 0xFF) {
+            raw[rn] = @intCast(cp);
+            rn += 1;
+        } else {
+            if (rn + l > raw.len) break;
+            @memcpy(raw[rn .. rn + l], s[ri .. ri + l]);
+            rn += l;
+        }
+        ri += l;
+    }
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < rn) {
+        const c = raw[i];
+        if (c <= ' ' or c == 0x7f) { i += 1; continue; } // whitespace incl. wraps
+        if (c == 0xA0 or c == 0xAD or c == 0x85) { i += 1; continue; } // folded NBSP/SHY/NEL
+        if (c == 0xC2 and i + 1 < rn and raw[i + 1] == 0xA0) { i += 2; continue; } // NBSP
+        if (c == 0xEF and i + 2 < rn and raw[i + 1] == 0xBB and raw[i + 2] == 0xBF) { i += 3; continue; } // BOM
+        if (c == 0xE2 and i + 2 < rn and raw[i + 1] == 0x80) {
+            const b2 = raw[i + 2];
+            if (b2 == 0x8B or b2 == 0x8C or b2 == 0x8D) { i += 3; continue; } // ZWSP/ZWNJ/ZWJ
+            if (b2 >= 0x90 and b2 <= 0x95) { // U+2010..U+2015 dashes
+                if (n >= buf.len) return error.BadSessionId;
+                buf[n] = '-';
+                n += 1;
+                i += 3;
+                continue;
+            }
+        }
+        if (c == 0xE2 and i + 2 < rn and raw[i + 1] == 0x88 and raw[i + 2] == 0x92) { // U+2212 minus
+            if (n >= buf.len) return error.BadSessionId;
+            buf[n] = '-';
+            n += 1;
+            i += 3;
+            continue;
+        }
+        if (n >= buf.len) return error.BadSessionId;
+        buf[n] = c;
+        n += 1;
+        i += 1;
+    }
+    const cs = buf[0..n];
+    const first = std.mem.indexOfScalar(u8, cs, '-') orelse return error.BadSessionId;
+    const ip = cs[0..first];
+    const rest = cs[first + 1 ..];
     const second = std.mem.indexOfScalar(u8, rest, '-') orelse return error.BadSessionId;
     const port = try std.fmt.parseInt(u16, rest[0..second], 10);
     const key = rest[second + 1 ..];

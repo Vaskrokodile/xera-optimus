@@ -50,6 +50,9 @@ pub const Term = struct {
     seq_len: usize = 0,
     x10: [3]u8 = undefined,
     x10_need: u8 = 0,
+    pending_high: u16 = 0, // UTF-16 high surrogate awaiting its low half
+    moji: [4]u8 = undefined, // 0x80..0xFF chars pending UTF-8 repair
+    moji_len: u8 = 0,
     paste_buf: std.ArrayList(u8) = undefined,
     paste_alloc: std.mem.Allocator = undefined,
 
@@ -148,8 +151,12 @@ pub const Term = struct {
         while (i < n) : (i += 1) {
             const rec = recs[i];
             switch (rec.EventType) {
-                4 => try keys.append(.resize), // WINDOW_BUFFER_SIZE_EVENT
+                4 => { // WINDOW_BUFFER_SIZE_EVENT
+                    try self.flushMoji(keys);
+                    try keys.append(.resize);
+                },
                 2 => { // MOUSE_EVENT
+                    try self.flushMoji(keys);
                     const m = rec.Event.MouseEvent;
                     const flags = m.dwEventFlags;
                     if (flags == 0) { // button press/release, not move/wheel
@@ -181,12 +188,49 @@ pub const Term = struct {
                     if (k.bKeyDown == 0) continue;
                     const ctrl = (k.dwControlKeyState & 0x000C) != 0; // left|right ctrl
                     const uc: u32 = k.UnicodeChar;
+                    // Anything that can't be a UTF-8 byte char ends a
+                    // pending mojibake-repair sequence (below).
+                    if (uc < 0x80 or uc > 0xFF) try self.flushMoji(keys);
                     // Printable characters. With ENABLE_VIRTUAL_TERMINAL_INPUT the
                     // console delivers escape sequences (mouse reports, focus events,
                     // CSI arrow keys) here too, so they are reassembled by feedByte()
                     // instead of being inserted into the composer as literal text.
                     if (uc >= 0x20 and uc != 0x7f) {
-                        try self.feedByte(keys, @intCast(uc));
+                        // UnicodeChar is a UTF-16 code unit — re-encode to
+                        // UTF-8 before feeding the byte parser. A bare
+                        // @intCast would panic on chars > U+00FF and
+                        // mojibake U+0080..U+00FF as lone bytes.
+                        var cp = uc;
+                        if (cp >= 0xD800 and cp <= 0xDBFF) {
+                            self.pending_high = @intCast(cp);
+                            continue;
+                        }
+                        if (cp >= 0xDC00 and cp <= 0xDFFF) {
+                            if (self.pending_high == 0) continue;
+                            cp = 0x10000 + ((@as(u32, self.pending_high) - 0xD800) << 10) + (cp - 0xDC00);
+                            self.pending_high = 0;
+                        } else self.pending_high = 0;
+                        if (cp <= 0xFF) {
+                            // Some hosts decode pasted UTF-8 bytes into
+                            // code-page chars first (uc = a raw byte).
+                            // Buffer them: a completed valid sequence is
+                            // re-encoded as real UTF-8, a broken one is
+                            // treated as ordinary Latin-1 input.
+                            self.moji[self.moji_len] = @intCast(cp);
+                            self.moji_len += 1;
+                            const want = std.unicode.utf8ByteSequenceLength(self.moji[0]) catch blk: {
+                                try self.flushMoji(keys);
+                                break :blk 0;
+                            };
+                            if (want > 0 and self.moji_len >= want) {
+                                if (std.unicode.utf8Decode(self.moji[0..want])) |real| {
+                                    self.moji_len = 0;
+                                    try self.feedCp(keys, real);
+                                } else |_| try self.flushMoji(keys);
+                            }
+                            continue;
+                        }
+                        try self.feedCp(keys, cp);
                         continue;
                     }
                     // Inside a bracketed paste every byte is literal text,
@@ -256,6 +300,9 @@ pub const Term = struct {
                 else => {},
             }
         }
+        // A buffered char that didn't complete a UTF-8 sequence by the end
+        // of the batch is ordinary Latin-1 input — don't leave it pending.
+        try self.flushMoji(keys);
         // A sequence still open here was truncated by the console (or the
         // window closed). Never leak its bytes into the composer.
         if (self.state == .csi and self.seq_len > 0) {
@@ -377,6 +424,21 @@ pub const Term = struct {
                 }
             },
         }
+    }
+
+    /// Emit one codepoint to the key parser as UTF-8 bytes.
+    fn feedCp(self: *Term, keys: *std.ArrayList(Key), cp: u32) !void {
+        var tmp: [4]u8 = undefined;
+        const n = std.unicode.utf8Encode(@intCast(cp), &tmp) catch return;
+        for (tmp[0..n]) |tb| try self.feedByte(keys, tb);
+    }
+
+    /// Pending 0x80..0xFF chars that didn't complete a UTF-8 sequence —
+    /// emitted as individual codepoints (real Latin-1 input).
+    fn flushMoji(self: *Term, keys: *std.ArrayList(Key)) !void {
+        var j: usize = 0;
+        while (j < self.moji_len) : (j += 1) try self.feedCp(keys, self.moji[j]);
+        self.moji_len = 0;
     }
 
     fn emitX10(self: *Term, keys: *std.ArrayList(Key)) !void {
