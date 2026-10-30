@@ -3,6 +3,7 @@ const util = @import("util.zig");
 const llm = @import("llm.zig");
 const harness = @import("harness.zig");
 const config = @import("config.zig");
+const live = @import("live.zig");
 
 pub const Ui = struct {
     ctx: *anyopaque,
@@ -36,6 +37,8 @@ pub const ToolCtx = struct {
     depth: u8 = 0,
     /// forwarded to subagents so their activity is visible
     ui: ?*const Ui = null,
+    /// live observability stream, shared with subagents
+    livelog: ?*live.Live = null,
     /// shared "always allow" set across subagents
     always_allow: ?*std.StringHashMap(void) = null,
     /// set by the agent so the `task` tool can spawn a nested run

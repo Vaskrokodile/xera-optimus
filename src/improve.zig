@@ -6,8 +6,14 @@ const llm = @import("llm.zig");
 const tools = @import("tools.zig");
 const harness = @import("harness.zig");
 const agent = @import("agent.zig");
+const live = @import("live.zig");
 
 pub const Mode = enum { parallel, sequential };
+
+/// Escape `s` for embedding in a JSON string fragment (no quotes added).
+fn je(alloc: std.mem.Allocator, s: []const u8) []const u8 {
+    return util.jescape(alloc, s) catch "";
+}
 
 pub const Options = struct {
     k: u8 = 2,
@@ -388,6 +394,10 @@ pub fn run(
         try copyTree(alloc, snap, try std.fs.path.join(alloc, &.{ ctx_dir, "harness" }));
     }
 
+    live.improvement(alloc, try std.fmt.allocPrint(alloc,
+        "\"phase\":\"start\",\"task\":\"{s}\",\"k\":{d},\"mode\":\"{s}\",\"run_dir\":\"{s}\",\"harness\":\"{s}\",\"cwd\":\"{s}\"",
+        .{ je(alloc, full_task), opts.k, @tagName(opts.mode), je(alloc, run_dir), je(alloc, h.dir), je(alloc, cwd) }));
+
     while (round < rounds) : (round += 1) {
         if (rounds > 1) {
             const m = try std.fmt.allocPrint(alloc, "── improve round {d}/{d} ──", .{ round + 1, rounds });
@@ -425,6 +435,9 @@ pub fn run(
             try writeFile(alloc, run_dir, "dry-run.txt", b.items);
             say(ui, b.items);
             say(ui, "dry run complete; nothing applied");
+            live.improvement(alloc, try std.fmt.allocPrint(alloc,
+                "\"phase\":\"dry_run\",\"task\":\"{s}\",\"candidates\":{d},\"run_dir\":\"{s}\"",
+                .{ je(alloc, full_task), cands.len, je(alloc, run_dir) }));
             return;
         }
 
@@ -493,6 +506,9 @@ pub fn run(
         try ctxFile(alloc, ctx_dir, try std.fmt.allocPrint(alloc, "decisions/compose-r{d}.md", .{round}), report);
         try ew.print("## round {d} compose\n{s}\n\n", .{ round, report });
         say(ui, report);
+        live.improvement(alloc, try std.fmt.allocPrint(alloc,
+            "\"phase\":\"compose\",\"round\":{d},\"adopt\":\"{s}\",\"rationale\":\"{s}\",\"lesson\":\"{s}\",\"files\":{d},\"run_dir\":\"{s}\"",
+            .{ round, je(alloc, comp.adopt), je(alloc, comp.rationale), je(alloc, comp.lesson), comp.final_files.len, je(alloc, run_dir) }));
     }
 
     // persist the final adopted harness into the library (cross-task evidence)

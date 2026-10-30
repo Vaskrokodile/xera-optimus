@@ -170,6 +170,31 @@ Every turn is appended as JSONL to `~/.xera-optimus/sessions/<id>.jsonl`.
 `xera-optimus sessions` lists them; `xera-optimus resume <id>` or `/resume <id>`
 loads one into context.
 
+## Live observability
+
+In parallel with session transcripts, every event is streamed to
+`~/.xera-optimus/live/<session-id>.jsonl`: prompts (with multiplayer authors),
+assistant text, **reasoning traces**, tool calls + results, skills loaded
+(`skill_load`), subagent spawns (`task`), per-call token usage, and turn ends.
+Harness² runs append to `~/.xera-optimus/live/improvements.jsonl`
+(`start` / `compose` / `dry_run` phases, with the adopted lesson).
+
+A zero-dependency site renders all of it live in 3D — each session becomes a
+helix of nodes colored by event type, like watching the agent's neural activity:
+
+```
+python3 tools/livesite/serve.py          # → http://localhost:8377
+```
+
+- **neural map** — live 3D graph (Three.js), nodes grow in as events stream;
+  click a node for the full text/args; gold cluster at the center = harness²
+  self-improvements.
+- **statistics** — avg skills / tool calls / tokens per session, tool +
+  skill histograms, per-session table, and the improvement feed with lessons.
+
+`--live-dir` / `XERA_LIVE_DIR` overrides the source dir. The server is
+read-only over the logs; agents never depend on it running.
+
 ## Build
 
 Zig **0.14.1**:
@@ -193,6 +218,8 @@ src/agent.zig     the agent loop: turn, tool dispatch, subagents, compaction
 src/harness.zig   Harness² components: load, assemble, edit, snapshot
 src/improve.zig   Propose–Probe–Compose recursion
 src/session.zig   JSONL transcripts, list, resume
+src/live.zig      live event stream (~/.xera-optimus/live/*.jsonl)
+tools/livesite/   zero-dep 3D observability site (serve.py + Three.js)
 src/tui.zig       terminal layer: raw mode, alt screen, key input, styles
 src/tui_app.zig   Codex-style TUI: scrollback blocks, composer, spinner,
                   approvals, worker thread + event queue, diffed rendering

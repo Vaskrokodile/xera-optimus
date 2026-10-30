@@ -7,6 +7,7 @@ const tools = @import("tools.zig");
 const harness = @import("harness.zig");
 const session = @import("session.zig");
 const hooks_mod = @import("hooks.zig");
+const live = @import("live.zig");
 
 pub const Ui = tools.Ui;
 
@@ -31,6 +32,8 @@ pub const Agent = struct {
     approver: ?*const tools.Approver = null,
     interactive: bool = false,
     slog: ?*session.Log = null,
+    /// live observability stream (~/.xera-optimus/live/<id>.jsonl)
+    livelog: ?*live.Live = null,
     usage: llm.Usage = .{},
     trajectory: std.ArrayList(u8),
     always_allow: *std.StringHashMap(void),
@@ -103,6 +106,11 @@ pub const Agent = struct {
     /// Push a user message and run the tool loop to completion.
     /// Returns the final assistant text.
     pub fn runTask(self: *Agent, prompt: []const u8) !RunOutcome {
+        return self.runTaskAuthored(prompt, "");
+    }
+
+    /// runTask with a multiplayer author tag for observability.
+    pub fn runTaskAuthored(self: *Agent, prompt: []const u8, author: []const u8) !RunOutcome {
         // UserPromptSubmit hook (c8): may attach context or block
         const pl = try std.fmt.allocPrint(self.alloc,
             "{{\"event\":\"UserPromptSubmit\",\"cwd\":\"{s}\"}}", .{try util.jescape(self.alloc, self.cwd)});
@@ -114,7 +122,11 @@ pub const Agent = struct {
         const um = try llm.userMessage(self.alloc, final_prompt);
         try self.messages.append(um);
         if (self.slog) |s| try s.append(um);
-        return self.loop();
+        if (self.livelog) |lv| lv.user(prompt, final_prompt, author, self.depth);
+        const outcome = try self.loop();
+        if (self.livelog) |lv| lv.turnEnd(outcome.stop_reason, outcome.iterations,
+            self.usage.prompt, self.usage.completion, self.depth);
+        return outcome;
     }
 
     /// Continue the loop with whatever is already in history.
@@ -146,6 +158,16 @@ pub const Agent = struct {
 
             try self.messages.append(res.assistant_message);
             if (self.slog) |s| try s.append(res.assistant_message);
+            if (self.livelog) |lv| {
+                if (res.reasoning.len > 0) lv.reasoning(res.reasoning, self.depth);
+                var names = std.ArrayList(u8).init(self.alloc);
+                for (res.tool_calls, 0..) |call, ci| {
+                    if (ci > 0) try names.append(',');
+                    try names.appendSlice(call.name);
+                }
+                lv.assistant(res.content, names.items, self.depth);
+                lv.usage(res.usage.prompt, res.usage.completion, self.depth);
+            }
             if (res.content.len > 0) {
                 last_text = res.content;
                 try self.trajectory.appendSlice("\n## assistant\n");
@@ -214,7 +236,7 @@ pub const Agent = struct {
         const pre = self.fireHook("PreToolUse", pre_payload, t.name);
         if (pre.len > 0) {
             const msg = try std.fmt.allocPrint(self.alloc, "error: hook blocked {s}: {s}", .{ t.name, pre });
-            self.uiToolResult(t.name, msg, false);
+            self.reportResult(t.name, msg, false, call.id);
             try self.trajTool(t.name, summary, msg);
             return msg;
         }
@@ -223,7 +245,7 @@ pub const Agent = struct {
         if (try self.needsApproval(t.*)) {
             const approved = try self.askApproval(t.*, summary);
             if (!approved) {
-                self.uiToolResult(t.name, "denied by user", false);
+                self.reportResult(t.name, "denied by user", false, call.id);
                 try self.trajTool(t.name, summary, "denied by user");
                 return std.fmt.allocPrint(self.alloc, "error: user denied {s} ({s})", .{ t.name, summary });
             }
@@ -233,10 +255,21 @@ pub const Agent = struct {
             if (u.on_tool_call) |f| f(u.ctx, t.name, summary);
         }
         try self.trajCall(t.name, summary, call.arguments);
+        if (self.livelog) |lv| {
+            lv.toolCall(t.name, summary, call.arguments, call.id, self.depth);
+            if (std.mem.eql(u8, t.name, "skill_load")) {
+                if (util.jstr(args, "name")) |sk| lv.skillUsed(sk, self.depth);
+            } else if (std.mem.eql(u8, t.name, "task")) {
+                const persona = util.jstr(args, "agent") orelse "";
+                const title = util.jstr(args, "title") orelse
+                    (util.jstr(args, "prompt") orelse "");
+                lv.subagent(persona, util.firstLine(title), self.depth);
+            }
+        }
 
         const out = t.run(&tctx, args) catch |e| {
             const msg = try std.fmt.allocPrint(self.alloc, "error: {s} failed: {s}", .{ t.name, @errorName(e) });
-            self.uiToolResult(t.name, msg, false);
+            self.reportResult(t.name, msg, false, call.id);
             try self.trajTool(t.name, summary, msg);
             return msg;
         };
@@ -250,7 +283,7 @@ pub const Agent = struct {
         else
             out;
         const preview = try util.truncateMiddle(scratch, final_out, 400);
-        self.uiToolResult(t.name, preview, !std.mem.startsWith(u8, out, "error:"));
+        self.reportResult(t.name, preview, !std.mem.startsWith(u8, out, "error:"), call.id);
         try self.trajTool(t.name, summary, preview);
         return final_out;
     }
@@ -266,6 +299,7 @@ pub const Agent = struct {
             .approver = self.approver,
             .depth = self.depth,
             .ui = self.ui,
+            .livelog = self.livelog,
             .always_allow = self.always_allow,
             .subagent_run = subagentRun,
         };
@@ -290,10 +324,12 @@ pub const Agent = struct {
         }
     }
 
-    fn uiToolResult(self: *Agent, name: []const u8, preview: []const u8, ok: bool) void {
+    /// Report a tool result to both the UI and the live event stream.
+    fn reportResult(self: *Agent, name: []const u8, preview: []const u8, ok: bool, call_id: []const u8) void {
         if (self.ui) |u| {
             if (u.on_tool_result) |f| f(u.ctx, name, preview, ok);
         }
+        if (self.livelog) |lv| lv.toolResult(name, ok, preview, call_id, self.depth);
     }
 
     fn trajCall(self: *Agent, name: []const u8, summary: []const u8, args: []const u8) !void {
@@ -342,6 +378,7 @@ pub const Agent = struct {
         );
         sub.approver = tctx.approver;
         sub.ui = tctx.ui;
+        sub.livelog = tctx.livelog;
         if (tctx.always_allow) |aa| sub.always_allow = aa;
         _ = sub.fireHook("SubagentStart", "{\"event\":\"SubagentStart\"}", "");
         const outcome = try sub.runTask(prompt);

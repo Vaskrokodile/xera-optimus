@@ -7,6 +7,7 @@ const tools = @import("tools.zig");
 const harness = @import("harness.zig");
 const agent = @import("agent.zig");
 const session = @import("session.zig");
+const live = @import("live.zig");
 const improve = @import("improve.zig");
 
 const a = util.ansi;
@@ -192,6 +193,10 @@ pub fn replLoop(
     }
     var log = try session.create(alloc, cfg, cwd);
     ag.slog = &log;
+    if (live.Live.create(alloc, log.id) catch null) |lv| {
+        ag.livelog = lv;
+        lv.sessionStart(cwd, cfg.model, h.dir, "repl");
+    }
     var ui_obj = ui();
     ag.ui = &ui_obj;
     ag.approver = &approver_inst;

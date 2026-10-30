@@ -7,6 +7,7 @@ const tools = @import("tools.zig");
 const harness = @import("harness.zig");
 const agent = @import("agent.zig");
 const session = @import("session.zig");
+const live = @import("live.zig");
 const improve = @import("improve.zig");
 const repl = @import("repl.zig");
 const tui_app = @import("tui_app.zig");
@@ -268,6 +269,10 @@ fn cmdExec(
     var q = repl.quietUi();
     ag.ui = &q;
     ag.slog = &log;
+    if (live.Live.create(alloc, log.id) catch null) |lv| {
+        ag.livelog = lv;
+        lv.sessionStart(cwd, cfg.model, h.dir, "exec");
+    }
     // exec is non-interactive: approver null -> auto-approve
     const outcome = ag.runTask(prompt) catch |e| {
         std.debug.print("\nexec failed: {s}\n", .{@errorName(e)});

@@ -11,6 +11,7 @@ const tools = @import("tools.zig");
 const harness = @import("harness.zig");
 const agent = @import("agent.zig");
 const session = @import("session.zig");
+const live = @import("live.zig");
 const tui = @import("tui.zig");
 const mp = @import("mp.zig");
 
@@ -376,6 +377,7 @@ pub const App = struct {
     full_redraw: bool = true,
     session_id: []const u8 = "",
     slog: ?*session.Log = null,
+    livelog: ?*live.Live = null,
 
     // ---- multiplayer state ----
     name: []const u8 = "you",
@@ -454,6 +456,11 @@ pub const App = struct {
         defer {
             if (app.mp_client) |c| c.close();
             if (app.mp_server) |s| s.stop();
+        }
+
+        if (live.Live.create(alloc, log.id) catch null) |lv| {
+            app.livelog = lv;
+            lv.sessionStart(cwd, cfg.model, h.dir, app.name);
         }
 
         // welcome: gradient logo + tagline
@@ -2470,6 +2477,7 @@ fn makeThWorker(app: *App, alloc: std.mem.Allocator, thread: []const u8, seed: [
     w.ag.ui = &w.ui;
     w.ag.approver = &w.approver;
     w.ag.slog = app.slog;
+    w.ag.livelog = app.livelog;
     return w;
 }
 
@@ -2497,6 +2505,7 @@ fn workerLoop(app: *App) !void {
                 main.ag.ui = &main.ui;
                 main.ag.approver = &main.approver;
                 main.ag.slog = app.slog;
+                main.ag.livelog = app.livelog;
                 app.ag_ptr.store(&main.ag, .release);
                 app.q.push(.cleared);
             },
@@ -2549,7 +2558,7 @@ fn workerLoop(app: *App) !void {
                 };
                 w.ag.interrupted.store(false, .release);
                 app.ag_ptr.store(&w.ag, .release);
-                const outcome = w.ag.runTask(p.text) catch |e| {
+                const outcome = w.ag.runTaskAuthored(p.text, p.author) catch |e| {
                     const msg = try std.fmt.allocPrint(alloc, "{s}", .{@errorName(e)});
                     app.q.push(.{ .failed = msg });
                     continue;

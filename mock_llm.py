@@ -134,6 +134,10 @@ class H(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-cache")
             self.end_headers()
             if kind == "final":
+                self.wfile.write(sse(chunk(
+                    {"reasoning_content": "thinking: what does the user want? "
+                                          "the prompt is simple — answer directly."})))
+                self.wfile.flush()
                 text = rest[0]
                 for piece in re.findall(r".{1,20}", text, flags=re.S):
                     self.wfile.write(sse(chunk({"content": piece})))

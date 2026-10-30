@@ -27,6 +27,8 @@ pub const ChatResult = struct {
     /// assistant message (with content + tool_calls) ready to append to history
     assistant_message: std.json.Value,
     content: []const u8,
+    /// reasoning/thinking trace, when the provider streams it ("" otherwise)
+    reasoning: []const u8 = "",
     tool_calls: []ToolCall,
     finish_reason: []const u8,
     usage: Usage,
@@ -255,6 +257,10 @@ fn resultFromMessage(alloc: std.mem.Allocator, root: std.json.Value) !ChatResult
             }
         }
     }
+    var reasoning: []const u8 = "";
+    if (util.jget(message, "reasoning_content") orelse util.jget(message, "reasoning")) |r| {
+        if (r == .string) reasoning = r.string;
+    }
     const finish = util.jstr(c0, "finish_reason") orelse "stop";
     var usage = Usage{};
     if (util.jget(root, "usage")) |u| {
@@ -264,6 +270,7 @@ fn resultFromMessage(alloc: std.mem.Allocator, root: std.json.Value) !ChatResult
     return .{
         .assistant_message = message,
         .content = content,
+        .reasoning = reasoning,
         .tool_calls = try calls.toOwnedSlice(),
         .finish_reason = finish,
         .usage = usage,
@@ -275,6 +282,7 @@ fn resultFromMessage(alloc: std.mem.Allocator, root: std.json.Value) !ChatResult
 const StreamCtx = struct {
     alloc: std.mem.Allocator,
     content: std.ArrayList(u8),
+    reasoning: std.ArrayList(u8),
     // tool calls keyed by delta index
     tc_ids: std.ArrayList(?[]u8),
     tc_names: std.ArrayList(std.ArrayList(u8)),
@@ -315,8 +323,9 @@ fn onSseData(ctx_ptr: *anyopaque, data: []const u8) anyerror!void {
             if (ctx.on_delta) |cb| cb.f(cb.ctx, c.string);
         }
     }
-    if (util.jget(delta, "reasoning_content")) |c| {
+    if (util.jget(delta, "reasoning_content") orelse util.jget(delta, "reasoning")) |c| {
         if (c == .string and c.string.len > 0) {
+            try ctx.reasoning.appendSlice(c.string);
             if (ctx.on_reasoning) |cb| cb.f(cb.ctx, c.string);
         }
     }
@@ -351,6 +360,7 @@ fn streamChat(
     var ctx = StreamCtx{
         .alloc = alloc,
         .content = std.ArrayList(u8).init(alloc),
+        .reasoning = std.ArrayList(u8).init(alloc),
         .tc_ids = std.ArrayList(?[]u8).init(alloc),
         .tc_names = std.ArrayList(std.ArrayList(u8)).init(alloc),
         .tc_args = std.ArrayList(std.ArrayList(u8)).init(alloc),
@@ -400,6 +410,7 @@ fn streamChat(
     return .{
         .assistant_message = .{ .object = obj },
         .content = content_str,
+        .reasoning = try ctx.reasoning.toOwnedSlice(),
         .tool_calls = try calls.toOwnedSlice(),
         .finish_reason = ctx.finish,
         .usage = ctx.usage,
