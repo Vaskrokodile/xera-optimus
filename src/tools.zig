@@ -5,6 +5,7 @@ const harness = @import("harness.zig");
 const config = @import("config.zig");
 const live = @import("live.zig");
 const coord_mod = @import("coord.zig");
+const memory_mod = @import("memory.zig");
 
 pub const Ui = struct {
     ctx: *anyopaque,
@@ -49,6 +50,8 @@ pub const ToolCtx = struct {
     coord: ?*coord_mod.Coordinator = null,
     /// this agent's id inside the coordinator ("main", "t-1", "main/s")
     aid: []const u8 = "",
+    /// supermemory client; null when no api key is configured
+    memory: ?*memory_mod.Memory = null,
 };
 
 pub const Tool = struct {
@@ -196,6 +199,15 @@ pub const tools = [_]Tool{
         .run = runCoord,
         .summary = sumCoord,
     },
+    .{
+        .name = "memory",
+        .description = "Long-term memory (supermemory). op: remember(m=fact/preference/decision to keep — instant) · recall(q=query, n?=limit default 6) · profile (who is this workspace/user) · forget(ids=comma-sep memory ids) · forget_q(q=what to forget, apply=true to confirm; previews first). Recall runs automatically per prompt; use remember for durable facts the turn doesn't capture.",
+        .schema_src = \\{"type":"object","properties":{"op":{"type":"string","enum":["remember","recall","profile","forget","forget_q"]},"q":{"type":"string"},"m":{"type":"string"},"ids":{"type":"string"},"n":{"type":"integer"},"apply":{"type":"boolean"}},"required":["op"]}
+        ,
+        .danger = .safe,
+        .run = runMemory,
+        .summary = sumMem,
+    },
 };
 
 pub fn schemas(alloc: std.mem.Allocator) ![]llm.ToolSchema {
@@ -312,6 +324,13 @@ fn sumCoord(ctx: *ToolCtx, args: std.json.Value) []const u8 {
     const op = argStr(args, "op") orelse return "?";
     const extra = argStr(args, "pat") orelse argStr(args, "to") orelse "";
     return std.fmt.allocPrint(ctx.scratch, "{s} {s}", .{ op, extra }) catch op;
+}
+
+fn sumMem(ctx: *ToolCtx, args: std.json.Value) []const u8 {
+    const op = argStr(args, "op") orelse return "?";
+    const extra = argStr(args, "q") orelse argStr(args, "m") orelse argStr(args, "ids") orelse "";
+    const short = util.truncateMiddle(ctx.scratch, extra, 60) catch extra;
+    return std.fmt.allocPrint(ctx.scratch, "{s} {s}", .{ op, short }) catch op;
 }
 
 fn sumUrl(ctx: *ToolCtx, args: std.json.Value) []const u8 {
@@ -807,6 +826,57 @@ fn runCoord(ctx: *ToolCtx, args: std.json.Value) ![]const u8 {
         return "note set";
     }
     return std.fmt.allocPrint(ctx.alloc, "error: unknown op '{s}' (claim|rel|status|send|poll|note)", .{op});
+}
+
+// ---------- memory (supermemory) ----------
+
+fn runMemory(ctx: *ToolCtx, args: std.json.Value) ![]const u8 {
+    const mem = ctx.memory orelse
+        return "error: memory inactive (no SUPERMEMORY_API_KEY / memory_key configured)";
+    const op = argStr(args, "op") orelse return "error: missing op";
+
+    if (std.mem.eql(u8, op, "remember")) {
+        const m = argStr(args, "m") orelse return "error: remember needs m";
+        const meta = try std.fmt.allocPrint(ctx.scratch,
+            "{{\"src\":\"agent\",\"aid\":\"{s}\"}}", .{ctx.aid});
+        const doc = try std.fmt.allocPrint(ctx.scratch, "xera-notes-{s}", .{ctx.aid});
+        const out = try mem.add(ctx.scratch, m, doc, meta, "instant");
+        if (ctx.livelog) |lv| lv.memEvent("remember", util.firstLine(m), ctx.depth);
+        if (ctx.coord) |co| co.emit("M", ctx.aid, util.firstLine(m));
+        return try ctx.alloc.dupe(u8, out);
+    }
+    if (std.mem.eql(u8, op, "recall")) {
+        const q = argStr(args, "q") orelse return "error: recall needs q";
+        var limit: usize = 6;
+        if (util.jget(args, "n")) |n| {
+            if (n == .integer and n.integer > 0 and n.integer <= 100) limit = @intCast(n.integer);
+        }
+        const out = try mem.search(ctx.scratch, q, limit);
+        if (ctx.livelog) |lv| lv.memEvent("recall", q, ctx.depth);
+        return try ctx.alloc.dupe(u8, if (out.len == 0) "(no relevant memories)" else out);
+    }
+    if (std.mem.eql(u8, op, "profile")) {
+        const out = try mem.profile(ctx.scratch);
+        return try ctx.alloc.dupe(u8, if (out.len == 0) "(empty profile)" else out);
+    }
+    if (std.mem.eql(u8, op, "forget")) {
+        const ids = argStr(args, "ids") orelse return "error: forget needs ids (comma-separated)";
+        const out = try mem.forget(ctx.scratch, ids);
+        if (ctx.livelog) |lv| lv.memEvent("forget", ids, ctx.depth);
+        return try ctx.alloc.dupe(u8, out);
+    }
+    if (std.mem.eql(u8, op, "forget_q")) {
+        const q = argStr(args, "q") orelse return "error: forget_q needs q";
+        var apply = false;
+        if (util.jget(args, "apply")) |a| {
+            if (a == .bool) apply = a.bool;
+        }
+        const out = try mem.forgetQuery(ctx.scratch, q, apply);
+        if (ctx.livelog) |lv| lv.memEvent(if (apply) "forget_q" else "forget_q_dry", q, ctx.depth);
+        return try ctx.alloc.dupe(u8, out);
+    }
+    return std.fmt.allocPrint(ctx.alloc,
+        "error: unknown op '{s}' (remember|recall|profile|forget|forget_q)", .{op});
 }
 
 // ---------- filesystem: delete / mkdir ----------

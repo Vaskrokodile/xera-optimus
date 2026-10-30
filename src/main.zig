@@ -11,6 +11,7 @@ const live = @import("live.zig");
 const improve = @import("improve.zig");
 const repl = @import("repl.zig");
 const tui_app = @import("tui_app.zig");
+const memory_mod = @import("memory.zig");
 
 const version = "0.1.0";
 
@@ -273,6 +274,15 @@ fn cmdExec(
         ag.livelog = lv;
         lv.sessionStart(cwd, cfg.model, h.dir, "exec");
     }
+    // long-term memory (supermemory) — same recall + capture as the TUI
+    if (memory_mod.Memory.create(alloc, hclient, cfg.memory_key, cfg.memory_base,
+        if (cfg.memory_namespace.len > 0) cfg.memory_namespace
+        else memory_mod.Memory.defaultNs(alloc, cwd))) |mem|
+    {
+        ag.memory = mem;
+        ag.mem_auto = cfg.memory_auto;
+        ag.mem_doc_id = try std.fmt.allocPrint(alloc, "xera-{s}-exec", .{log.id});
+    }
     // exec is non-interactive: approver null -> auto-approve
     const outcome = ag.runTask(prompt) catch |e| {
         std.debug.print("\nexec failed: {s}\n", .{@errorName(e)});
@@ -332,6 +342,24 @@ fn cmdDoctor(alloc: std.mem.Allocator, cfg: *const config.Config, hclient: *http
                 std.debug.print("  ⚠ configured model '{s}' not in list\n", .{cfg.model});
             }
         }
+    }
+
+    // memory layer (supermemory) — configured? reachable?
+    std.debug.print("\n", .{});
+    const ns = if (cfg.memory_namespace.len > 0) cfg.memory_namespace else "xera-<workspace>";
+    if (memory_mod.Memory.create(alloc, hclient, cfg.memory_key, cfg.memory_base, ns)) |mem| {
+        std.debug.print("  memory     : {s} ns={s} auto={s}\n", .{
+            cfg.memory_base, mem.ns, if (cfg.memory_auto) "on" else "off" });
+        const prof = mem.profile(alloc) catch |e| blk: {
+            break :blk std.fmt.allocPrint(alloc, "error: {s}", .{@errorName(e)}) catch "error";
+        };
+        if (std.mem.startsWith(u8, prof, "error:")) {
+            std.debug.print("  profile    : FAILED — {s}\n", .{prof});
+        } else {
+            std.debug.print("  profile    : ok\n", .{});
+        }
+    } else {
+        std.debug.print("  memory     : not configured (set SUPERMEMORY_API_KEY or memory_key in config.json)\n", .{});
     }
     return 0;
 }

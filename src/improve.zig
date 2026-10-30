@@ -7,6 +7,7 @@ const tools = @import("tools.zig");
 const harness = @import("harness.zig");
 const agent = @import("agent.zig");
 const live = @import("live.zig");
+const memory_mod = @import("memory.zig");
 
 pub const Mode = enum { parallel, sequential };
 
@@ -122,6 +123,16 @@ fn runExecution(
 
     var hh = harness.Harness{ .alloc = a, .dir = hdir, .root = root, .global = false };
     var ag = try agent.Agent.init(a, cfg, hclient, &hh, cwd, cwd, 0, "");
+    // Harness² learns across runs: probes recall prior lessons and the
+    // turn is captured into the workspace's memory namespace.
+    if (memory_mod.Memory.create(a, hclient, cfg.memory_key, cfg.memory_base,
+        if (cfg.memory_namespace.len > 0) cfg.memory_namespace
+        else memory_mod.Memory.defaultNs(a, cwd))) |mem|
+    {
+        ag.memory = mem;
+        ag.mem_auto = cfg.memory_auto;
+        ag.mem_doc_id = "xera-improve";
+    }
     var buf = std.ArrayList(u8).init(a);
     const cu = CollectUi.make(&buf, ui);
     ag.ui = &cu.ui;

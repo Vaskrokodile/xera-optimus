@@ -38,6 +38,15 @@ pub const Config = struct {
     max_iters: u32 = 60,
     /// rough char budget for history before compaction kicks in
     history_budget: usize = 200_000,
+    /// supermemory api key (SUPERMEMORY_API_KEY env or memory_key in config)
+    memory_key: ?[]const u8 = null,
+    /// supermemory base url — point at a self-hosted supermemory-local to
+    /// keep memory off the cloud entirely
+    memory_base: []const u8 = "https://api.supermemory.ai",
+    /// namespace override; empty = "xera-<workspace-name>"
+    memory_namespace: []const u8 = "",
+    /// auto-recall prompts + auto-capture turns into memory
+    memory_auto: bool = true,
 };
 
 const FileSchema = struct {
@@ -51,6 +60,10 @@ const FileSchema = struct {
     stream: ?bool = null,
     shell: ?[]const u8 = null,
     max_iters: ?u32 = null,
+    memory_key: ?[]const u8 = null,
+    memory_base: ?[]const u8 = null,
+    memory_namespace: ?[]const u8 = null,
+    memory_auto: ?bool = null,
 };
 
 pub const Cli = struct {
@@ -91,6 +104,10 @@ pub fn load(alloc: std.mem.Allocator, cli: Cli) !Config {
         if (parsed.approval) |v| {
             if (Approval.parse(v)) |a| cfg.approval = a;
         }
+        if (parsed.memory_key) |v| cfg.memory_key = v;
+        if (parsed.memory_base) |v| cfg.memory_base = trimSlash(v);
+        if (parsed.memory_namespace) |v| cfg.memory_namespace = v;
+        if (parsed.memory_auto) |v| cfg.memory_auto = v;
     } else |_| {}
 
     // env overrides
@@ -104,6 +121,12 @@ pub fn load(alloc: std.mem.Allocator, cli: Cli) !Config {
     }
     if (util.getenvBool(alloc, "XERA_FULL_AUTO")) |b| {
         if (b) cfg.approval = .full_auto;
+    }
+    if (util.getenv(alloc, "SUPERMEMORY_API_KEY")) |v| cfg.memory_key = v;
+    if (util.getenv(alloc, "XERA_MEMORY_BASE")) |v| cfg.memory_base = trimSlash(v);
+    if (util.getenv(alloc, "XERA_MEMORY_NS")) |v| cfg.memory_namespace = v;
+    if (util.getenvBool(alloc, "XERA_NO_MEMORY")) |b| {
+        if (b) cfg.memory_auto = false;
     }
 
     // api key via api_key_env when not set directly

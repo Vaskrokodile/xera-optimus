@@ -9,6 +9,7 @@ const session = @import("session.zig");
 const hooks_mod = @import("hooks.zig");
 const live = @import("live.zig");
 const coord_mod = @import("coord.zig");
+const memory_mod = @import("memory.zig");
 
 pub const Ui = tools.Ui;
 
@@ -50,6 +51,14 @@ pub const Agent = struct {
     aid: []const u8 = "",
     /// whether the coordinator join + protocol intro already happened
     coord_joined: bool = false,
+    /// supermemory client; null when unconfigured (memory tool inert,
+    /// no auto-recall/capture)
+    memory: ?*memory_mod.Memory = null,
+    /// stable document id for turn capture ("xera-<session>-<aid>");
+    /// empty = this agent doesn't capture turns (subagents don't)
+    mem_doc_id: []const u8 = "",
+    /// auto-recall + auto-capture toggle (config memory_auto)
+    mem_auto: bool = true,
 
     pub fn init(
         alloc: std.mem.Allocator,
@@ -131,10 +140,43 @@ pub const Agent = struct {
         try self.messages.append(um);
         if (self.slog) |s| try s.append(um);
         if (self.livelog) |lv| lv.user(prompt, final_prompt, author, self.depth);
+        try self.recallMemory(prompt);
         const outcome = try self.loop();
         if (self.livelog) |lv| lv.turnEnd(outcome.stop_reason, outcome.iterations,
             self.usage.prompt, self.usage.completion, self.depth);
+        self.captureMemory(prompt, author, outcome.text);
         return outcome;
+    }
+
+    /// Auto-recall: search long-term memory for this prompt and inject
+    /// hits as a <memory> system message. Best-effort — the turn must
+    /// never fail because the memory layer hiccuped.
+    fn recallMemory(self: *Agent, prompt: []const u8) !void {
+        const mem = self.memory orelse return;
+        if (!self.mem_auto) return;
+        const hits = mem.search(self.alloc, prompt, 6) catch return;
+        if (hits.len == 0 or std.mem.startsWith(u8, hits, "error:")) return;
+        if (self.livelog) |lv| lv.memEvent("recall_auto", prompt, self.depth);
+        try self.messages.append(try llm.systemMessage(self.alloc,
+            try std.fmt.allocPrint(self.alloc,
+                "<memory> durable context from prior sessions (id [sim] text):\n{s}\n</memory>",
+                .{hits})));
+    }
+
+    /// Auto-capture: hand the turn to supermemory as an append to this
+    /// agent's session document — it extracts/links the memories itself.
+    /// Fire-and-forget.
+    fn captureMemory(self: *Agent, prompt: []const u8, author: []const u8, answer: []const u8) void {
+        const mem = self.memory orelse return;
+        if (!self.mem_auto or self.mem_doc_id.len == 0) return;
+        const who = if (author.len > 0) author else "user";
+        const turn = std.fmt.allocPrint(self.alloc,
+            "{s}: {s}\nassistant[{s}]: {s}", .{ who, prompt, self.aid, answer }) catch return;
+        const meta = std.fmt.allocPrint(self.alloc,
+            "{{\"src\":\"xera-optimus\",\"agent\":\"{s}\"}}", .{self.aid}) catch return;
+        const out = mem.add(self.alloc, turn, self.mem_doc_id, meta, null) catch return;
+        if (self.livelog) |lv| lv.memEvent("capture", self.mem_doc_id, self.depth);
+        _ = out;
     }
 
     /// One-time coordinator join: pick an aid, register, inject the
@@ -350,6 +392,7 @@ pub const Agent = struct {
             .subagent_run = subagentRun,
             .coord = self.coord,
             .aid = self.aid,
+            .memory = self.memory,
         };
     }
 
@@ -433,6 +476,8 @@ pub const Agent = struct {
             try std.fmt.allocPrint(aalloc, "{s}/s", .{tctx.aid})
         else
             "s";
+        // memory tool works for subagents; turn capture stays on channel agents
+        sub.memory = tctx.memory;
         if (tctx.always_allow) |aa| sub.always_allow = aa;
         _ = sub.fireHook("SubagentStart", "{\"event\":\"SubagentStart\"}", "");
         const outcome = try sub.runTask(prompt);

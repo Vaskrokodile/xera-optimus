@@ -8,6 +8,7 @@ const harness = @import("harness.zig");
 const agent = @import("agent.zig");
 const session = @import("session.zig");
 const live = @import("live.zig");
+const memory_mod = @import("memory.zig");
 const improve = @import("improve.zig");
 
 const a = util.ansi;
@@ -196,6 +197,15 @@ pub fn replLoop(
     if (live.Live.create(alloc, log.id) catch null) |lv| {
         ag.livelog = lv;
         lv.sessionStart(cwd, cfg.model, h.dir, "repl");
+    }
+    // long-term memory (supermemory) — recall + capture like the TUI
+    if (memory_mod.Memory.create(alloc, hclient, cfg.memory_key, cfg.memory_base,
+        if (cfg.memory_namespace.len > 0) cfg.memory_namespace
+        else memory_mod.Memory.defaultNs(alloc, cwd))) |mem|
+    {
+        ag.memory = mem;
+        ag.mem_auto = cfg.memory_auto;
+        ag.mem_doc_id = try std.fmt.allocPrint(alloc, "xera-{s}-main", .{log.id});
     }
     var ui_obj = ui();
     ag.ui = &ui_obj;

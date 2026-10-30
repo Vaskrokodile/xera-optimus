@@ -15,6 +15,7 @@ const live = @import("live.zig");
 const tui = @import("tui.zig");
 const mp = @import("mp.zig");
 const coord_mod = @import("coord.zig");
+const memory_mod = @import("memory.zig");
 
 const sty = tui.Style;
 const Key = tui.Key;
@@ -381,6 +382,8 @@ pub const App = struct {
     livelog: ?*live.Live = null,
     /// coordination fabric shared by every channel agent + subagent
     coord: coord_mod.Coordinator,
+    /// supermemory client shared by all agents (null = unconfigured)
+    mem: ?*memory_mod.Memory = null,
 
     // ---- multiplayer state ----
     name: []const u8 = "you",
@@ -466,6 +469,12 @@ pub const App = struct {
             app.livelog = lv;
             lv.sessionStart(cwd, cfg.model, h.dir, app.name);
         }
+
+        // long-term memory: one supermemory namespace per workspace,
+        // shared by every channel agent + subagent
+        app.mem = memory_mod.Memory.create(alloc, hclient, cfg.memory_key, cfg.memory_base,
+            if (cfg.memory_namespace.len > 0) cfg.memory_namespace
+            else memory_mod.Memory.defaultNs(alloc, cwd));
 
         // welcome: gradient logo + tagline
         try app.blocks.append(.banner);
@@ -2484,6 +2493,9 @@ fn makeThWorker(app: *App, alloc: std.mem.Allocator, thread: []const u8, seed: [
     w.ag.livelog = app.livelog;
     w.ag.coord = &app.coord;
     w.ag.aid = if (thread.len > 0) w.uc.thread else "main";
+    w.ag.memory = app.mem;
+    w.ag.mem_auto = app.cfg.memory_auto;
+    w.ag.mem_doc_id = try std.fmt.allocPrint(alloc, "xera-{s}-{s}", .{ app.session_id, w.ag.aid });
     return w;
 }
 
@@ -2514,6 +2526,9 @@ fn workerLoop(app: *App) !void {
                 main.ag.livelog = app.livelog;
                 main.ag.coord = &app.coord;
                 main.ag.aid = "main";
+                main.ag.memory = app.mem;
+                main.ag.mem_auto = app.cfg.memory_auto;
+                main.ag.mem_doc_id = try std.fmt.allocPrint(alloc, "xera-{s}-main", .{app.session_id});
                 app.ag_ptr.store(&main.ag, .release);
                 app.q.push(.cleared);
             },

@@ -125,6 +125,16 @@ pub const Live = struct {
         self.emit("subagent", f, depth);
     }
 
+    /// Memory-layer event: remember / recall / forget / recall_auto / capture.
+    pub fn memEvent(self: *Live, what: []const u8, detail: []const u8, depth: u8) void {
+        const a = self.alloc;
+        const f = std.fmt.allocPrint(a, "{s},{s}", .{
+            fieldStr(a, "what", what) catch return,
+            fieldStr(a, "detail", detail) catch return,
+        }) catch return;
+        self.emit("memory", f, depth);
+    }
+
     /// Coordination-fabric event: claim / claim_conflict / blocked / send.
     pub fn coordEvent(self: *Live, what: []const u8, detail: []const u8, depth: u8) void {
         const a = self.alloc;

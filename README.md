@@ -100,12 +100,20 @@ costs almost no tokens:
   "model": "gpt-5",
   "max_tokens": 16384,
   "approval": "ask",                  // ask | full-auto
-  "stream": true
+  "stream": true,
+
+  // memory layer (supermemory) — all optional
+  "memory_key": "sm_...",             // or SUPERMEMORY_API_KEY env
+  "memory_base": "https://api.supermemory.ai", // or a self-hosted supermemory-local
+  "memory_namespace": "",             // default: "xera-<workspace-name>"
+  "memory_auto": true                 // auto-recall prompts + auto-capture turns
 }
 ```
 
 Environment overrides: `XERA_MODEL`, `XERA_BASE_URL`, `XERA_API_KEY`,
-`XERA_API_KEY_ENV`, `XERA_SHELL`, `XERA_FULL_AUTO`, `XERA_NO_STREAM`.
+`XERA_API_KEY_ENV`, `XERA_SHELL`, `XERA_FULL_AUTO`, `XERA_NO_STREAM`,
+`SUPERMEMORY_API_KEY`, `XERA_MEMORY_BASE`, `XERA_MEMORY_NS`,
+`XERA_NO_MEMORY`.
 
 Common flags: `-m/--model`, `--base-url`, `--api-key`, `-C/--cwd`,
 `-y/--full-auto`, `--no-stream`.
@@ -116,11 +124,37 @@ Common flags: `-m/--model`, `--base-url`, `--api-key`, `-C/--cwd`,
 `glob` `grep` `delete` (files or trees, workspace-confined) `make_dir`
 `run_shell` (cmd /c on Windows, /bin/sh elsewhere, with timeout)
 `web_fetch` (URL → text, HTML stripped) `web_search` (DuckDuckGo lite)
-`memory_append` `skill_load` `task` (subagent with fresh context, depth ≤ 2)
+`memory_append` `memory` (supermemory: remember/recall/profile/forget)
+`coord` (inter-agent claims, feed, inbox) `skill_load`
+`task` (subagent with fresh context, depth ≤ 2)
 
 In interactive mode, write/shell tools ask for approval (`y`/`n`/`a`lways).
 `exec` and `improve` run unattended (auto-approve). Writes are confined to the
 workspace root. `esc` interrupts a running turn.
+
+## Memory layer (supermemory)
+
+With `SUPERMEMORY_API_KEY` set, every agent gets durable cross-session
+memory via [supermemory](https://supermemory.ai) — their learner model
+extracts, links, updates and forgets facts; we just ship context in and
+pull it back out:
+
+- **auto-recall** — each prompt runs a hybrid search; relevant hits are
+  injected as a `<memory>` block before the turn (id + similarity shown,
+  so `forget` is one call away). Fails silently — memory can never break
+  a turn.
+- **auto-capture** — each finished turn is appended to the agent's
+  session document (`xera-<session>-<aid>`); supermemory's pipeline does
+  the fact extraction. Subagents share the namespace but don't capture.
+- **`memory` tool** — `remember` (instant, durable), `recall`, `profile`,
+  `forget`/`forget_q` (dry-run first, `apply:true` confirms).
+- **one namespace per workspace** (`xera-<dir>`), shared by main, every
+  thread agent and all subagents in multiplayer sessions — the whole
+  team literally shares a brain. `memory_append` still writes the local
+  `harness/memory.md`; the two layers coexist.
+- point `memory_base` at a [self-hosted](https://supermemory.ai/docs/self-hosting/overview)
+  supermemory-local to keep memory fully offline. `doctor` shows the
+  configured namespace and pings the profile endpoint.
 
 ## The harness (Harness²)
 
@@ -240,6 +274,8 @@ src/improve.zig   Propose–Probe–Compose recursion
 src/session.zig   JSONL transcripts, list, resume
 src/live.zig      live event stream (~/.xera-optimus/live/*.jsonl)
 src/coord.zig     inter-agent coordination fabric: claims, feed, inbox
+src/memory.zig    supermemory v5 client: document add, hybrid search,
+                  profile, forget (hosted or self-hosted)
 tools/livesite/   zero-dep 3D observability site (serve.py + Three.js)
 src/tui.zig       terminal layer: raw mode, alt screen, key input, styles
 src/tui_app.zig   Codex-style TUI: scrollback blocks, composer, spinner,
