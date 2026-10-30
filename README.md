@@ -70,6 +70,26 @@ the host's xera-optimus). The host owns the canonical log and runs all
 agents; peers' prompts are forwarded and answers broadcast. Set
 `XERA_NAME` to pick your display name.
 
+### Agent coordination
+
+Every agent the host runs — the shared channel, each thread's agent, and
+`task` subagents — shares one in-process **coordination fabric** so they
+don't trip over each other. It's structured signals, not chat, so it
+costs almost no tokens:
+
+- **claims** — an agent calls `coord{op:"claim",pat:"src/*.zig"}` before
+  writing. The file tools *hard-enforce* claims: writes into paths held
+  by another agent are refused (works even if a model never calls coord).
+  Claims persist until `coord{op:"rel"}` or ~10min expiry.
+- **feed** — successful writes/shell runs emit compact events
+  (`seq|kind|from|data`, ~40 bytes) that are pushed to siblings as
+  `<sync>` messages between model calls — awareness is free.
+- **inbox** — `coord{op:"send",to:"t-1"|"*",m:"..."}` for terse
+  agent→agent negotiation; `coord{op:"status"}` shows the roster with
+  notes and held claims.
+- A subagent shares its parent's lineage (`main/s` inherits `main`), so
+  delegated work is never blocked by the delegator's claims.
+
 ## Setup
 
 ```jsonc
@@ -219,6 +239,7 @@ src/harness.zig   Harness² components: load, assemble, edit, snapshot
 src/improve.zig   Propose–Probe–Compose recursion
 src/session.zig   JSONL transcripts, list, resume
 src/live.zig      live event stream (~/.xera-optimus/live/*.jsonl)
+src/coord.zig     inter-agent coordination fabric: claims, feed, inbox
 tools/livesite/   zero-dep 3D observability site (serve.py + Three.js)
 src/tui.zig       terminal layer: raw mode, alt screen, key input, styles
 src/tui_app.zig   Codex-style TUI: scrollback blocks, composer, spinner,

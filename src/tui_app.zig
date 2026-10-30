@@ -14,6 +14,7 @@ const session = @import("session.zig");
 const live = @import("live.zig");
 const tui = @import("tui.zig");
 const mp = @import("mp.zig");
+const coord_mod = @import("coord.zig");
 
 const sty = tui.Style;
 const Key = tui.Key;
@@ -378,6 +379,8 @@ pub const App = struct {
     session_id: []const u8 = "",
     slog: ?*session.Log = null,
     livelog: ?*live.Live = null,
+    /// coordination fabric shared by every channel agent + subagent
+    coord: coord_mod.Coordinator,
 
     // ---- multiplayer state ----
     name: []const u8 = "you",
@@ -447,6 +450,7 @@ pub const App = struct {
             .peers = std.ArrayList([]const u8).init(alloc),
             .clicks = std.ArrayList(ClickZone).init(alloc),
             .model = cfg.model,
+            .coord = coord_mod.Coordinator.init(alloc),
             .model_filter = std.ArrayList(u8).init(alloc),
             .name = std.process.getEnvVarOwned(alloc, "XERA_NAME") catch
                 std.process.getEnvVarOwned(alloc, "USERNAME") catch
@@ -2478,6 +2482,8 @@ fn makeThWorker(app: *App, alloc: std.mem.Allocator, thread: []const u8, seed: [
     w.ag.approver = &w.approver;
     w.ag.slog = app.slog;
     w.ag.livelog = app.livelog;
+    w.ag.coord = &app.coord;
+    w.ag.aid = if (thread.len > 0) w.uc.thread else "main";
     return w;
 }
 
@@ -2506,6 +2512,8 @@ fn workerLoop(app: *App) !void {
                 main.ag.approver = &main.approver;
                 main.ag.slog = app.slog;
                 main.ag.livelog = app.livelog;
+                main.ag.coord = &app.coord;
+                main.ag.aid = "main";
                 app.ag_ptr.store(&main.ag, .release);
                 app.q.push(.cleared);
             },

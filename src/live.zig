@@ -125,6 +125,16 @@ pub const Live = struct {
         self.emit("subagent", f, depth);
     }
 
+    /// Coordination-fabric event: claim / claim_conflict / blocked / send.
+    pub fn coordEvent(self: *Live, what: []const u8, detail: []const u8, depth: u8) void {
+        const a = self.alloc;
+        const f = std.fmt.allocPrint(a, "{s},{s}", .{
+            fieldStr(a, "what", what) catch return,
+            fieldStr(a, "detail", detail) catch return,
+        }) catch return;
+        self.emit("coord", f, depth);
+    }
+
     pub fn usage(self: *Live, prompt: u64, completion: u64, depth: u8) void {
         const f = std.fmt.allocPrint(self.alloc, "\"prompt\":{d},\"completion\":{d}", .{ prompt, completion }) catch return;
         self.emit("usage", f, depth);

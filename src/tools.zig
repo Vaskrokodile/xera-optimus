@@ -4,6 +4,7 @@ const llm = @import("llm.zig");
 const harness = @import("harness.zig");
 const config = @import("config.zig");
 const live = @import("live.zig");
+const coord_mod = @import("coord.zig");
 
 pub const Ui = struct {
     ctx: *anyopaque,
@@ -43,6 +44,11 @@ pub const ToolCtx = struct {
     always_allow: ?*std.StringHashMap(void) = null,
     /// set by the agent so the `task` tool can spawn a nested run
     subagent_run: ?*const fn (ctx: *ToolCtx, prompt: []const u8, agent_name: ?[]const u8) anyerror![]const u8 = null,
+    /// shared-session coordination fabric (claims, feed, inbox); null when
+    /// the agent isn't attached to a coordinator
+    coord: ?*coord_mod.Coordinator = null,
+    /// this agent's id inside the coordinator ("main", "t-1", "main/s")
+    aid: []const u8 = "",
 };
 
 pub const Tool = struct {
@@ -181,6 +187,15 @@ pub const tools = [_]Tool{
         .run = runTask,
         .summary = sumTask,
     },
+    .{
+        .name = "coord",
+        .description = "Coordinate with sibling agents in this shared session (threads + subagents). op: claim(pat=workspace glob you will write — enforced, persists until rel/~10m) · rel(pat? omit=all) · status (agents/notes/claims) · send(to=aid|'*', m) · poll (drain events+inbox; auto-delivered anyway) · note(m=what you're doing). Terse messages only.",
+        .schema_src = \\{"type":"object","properties":{"op":{"type":"string","enum":["claim","rel","status","send","poll","note"]},"pat":{"type":"string","description":"workspace-relative glob; comma-separated ok"},"to":{"type":"string"},"m":{"type":"string"}},"required":["op"]}
+        ,
+        .danger = .safe,
+        .run = runCoord,
+        .summary = sumCoord,
+    },
 };
 
 pub fn schemas(alloc: std.mem.Allocator) ![]llm.ToolSchema {
@@ -217,6 +232,46 @@ fn writeGuard(ctx: *ToolCtx, abs_path: []const u8) !void {
     if (!util.pathWithin(ctx.workspace, abs_path)) return error.OutsideWorkspace;
 }
 
+/// workspace-relative '/'-normalized form of an abs path; null when outside.
+fn relPath(ctx: *ToolCtx, abs: []const u8) ?[]const u8 {
+    if (!util.pathWithin(ctx.workspace, abs)) return null;
+    const ws = ctx.workspace;
+    const rel = abs[@min(ws.len, abs.len)..];
+    return std.mem.trimLeft(u8, rel, "/");
+}
+
+/// Hard enforcement: produce an error string when `abs` is claimed by
+/// another agent. Returns null when the write may proceed.
+fn claimConflict(ctx: *ToolCtx, abs: []const u8) ?[]const u8 {
+    const co = ctx.coord orelse return null;
+    const rel = relPath(ctx, abs) orelse return null;
+    const holder = co.conflict(ctx.aid, rel) orelse return null;
+    if (ctx.livelog) |lv| lv.coordEvent("blocked", rel, ctx.depth);
+    return std.fmt.allocPrint(ctx.alloc,
+        "error: '{s}' is claimed by agent '{s}' — coord send to negotiate, wait for their turn (claims auto-release), or work elsewhere",
+        .{ rel, holder }) catch null;
+}
+
+/// Emit a feed event for tools that mutate the workspace, so sibling
+/// agents see "who touched what" for free.
+pub fn emitWriteEvent(ctx: *ToolCtx, name: []const u8, args: std.json.Value, out: []const u8) void {
+    const co = ctx.coord orelse return;
+    if (std.mem.startsWith(u8, out, "error:")) return;
+    var buf: [512]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    if (std.mem.eql(u8, name, "write_file") or std.mem.eql(u8, name, "edit_file") or
+        std.mem.eql(u8, name, "delete") or std.mem.eql(u8, name, "make_dir"))
+    {
+        const p = argStr(args, "path") orelse return;
+        const abs = util.resolvePath(fba.allocator(), ctx.cwd, p) catch return;
+        const rel = relPath(ctx, abs) orelse p;
+        co.emit("w", ctx.aid, rel);
+    } else if (std.mem.eql(u8, name, "run_shell")) {
+        const c = argStr(args, "command") orelse return;
+        co.emit("$", ctx.aid, util.firstLine(c));
+    }
+}
+
 fn sumPath(ctx: *ToolCtx, args: std.json.Value) []const u8 {
     const p = argStr(args, "path") orelse return "?";
     _ = ctx;
@@ -251,6 +306,12 @@ fn sumTask(ctx: *ToolCtx, args: std.json.Value) []const u8 {
     if (argStr(args, "title")) |t| return t;
     const p = argStr(args, "prompt") orelse return "?";
     return util.firstLine(p);
+}
+
+fn sumCoord(ctx: *ToolCtx, args: std.json.Value) []const u8 {
+    const op = argStr(args, "op") orelse return "?";
+    const extra = argStr(args, "pat") orelse argStr(args, "to") orelse "";
+    return std.fmt.allocPrint(ctx.scratch, "{s} {s}", .{ op, extra }) catch op;
 }
 
 fn sumUrl(ctx: *ToolCtx, args: std.json.Value) []const u8 {
@@ -320,6 +381,7 @@ fn runWriteFile(ctx: *ToolCtx, args: std.json.Value) ![]const u8 {
     writeGuard(ctx, abs) catch {
         return std.fmt.allocPrint(ctx.alloc, "error: {s} is outside the workspace ({s}); denied", .{ abs, ctx.workspace });
     };
+    if (claimConflict(ctx, abs)) |msg| return msg;
     if (std.fs.path.dirname(abs)) |parent| try std.fs.cwd().makePath(parent);
     const f = try std.fs.cwd().createFile(abs, .{});
     defer f.close();
@@ -336,6 +398,7 @@ fn runEditFile(ctx: *ToolCtx, args: std.json.Value) ![]const u8 {
     writeGuard(ctx, abs) catch {
         return std.fmt.allocPrint(ctx.alloc, "error: {s} is outside the workspace ({s}); denied", .{ abs, ctx.workspace });
     };
+    if (claimConflict(ctx, abs)) |msg| return msg;
 
     const raw = std.fs.cwd().readFileAlloc(ctx.scratch, abs, 64 << 20) catch |e| {
         return std.fmt.allocPrint(ctx.alloc, "error: cannot read {s}: {s}", .{ abs, @errorName(e) });
@@ -670,6 +733,82 @@ fn runTask(ctx: *ToolCtx, args: std.json.Value) ![]const u8 {
     return runner(ctx, prompt, agent_name);
 }
 
+// ---------- coordination ----------
+
+/// Normalize a claim pattern to workspace-relative '/'-separated glob.
+/// Trailing '/' expands to "/**"; the workspace root itself becomes "**".
+fn coordNormPat(ctx: *ToolCtx, pat0: []const u8) ![]const u8 {
+    const pat = std.mem.trim(u8, pat0, " \t\"'");
+    if (pat.len == 0) return error.EmptyPattern;
+    const dir_claim = pat[pat.len - 1] == '/' or pat[pat.len - 1] == '\\';
+    const abs = try util.resolvePath(ctx.scratch, ctx.cwd, pat);
+    var rel = relPath(ctx, abs) orelse return error.OutsideWorkspace;
+    if (rel.len == 0) return "**";
+    if (dir_claim) rel = try std.fmt.allocPrint(ctx.scratch, "{s}/**", .{rel});
+    return rel;
+}
+
+fn runCoord(ctx: *ToolCtx, args: std.json.Value) ![]const u8 {
+    const co = ctx.coord orelse return "error: coord inactive (no shared session)";
+    const op = argStr(args, "op") orelse return "error: missing op";
+    const aid = ctx.aid;
+
+    if (std.mem.eql(u8, op, "claim")) {
+        const pat0 = argStr(args, "pat") orelse return "error: claim needs pat (workspace glob)";
+        var out = std.ArrayList(u8).init(ctx.scratch);
+        var it = std.mem.tokenizeScalar(u8, pat0, ',');
+        while (it.next()) |p0| {
+            const norm = coordNormPat(ctx, p0) catch {
+                try out.writer().print("{s}: bad pattern\n", .{std.mem.trim(u8, p0, " ")});
+                continue;
+            };
+            if (co.claim(aid, norm)) |holder| {
+                if (ctx.livelog) |lv| lv.coordEvent("claim_conflict", norm, ctx.depth);
+                try out.writer().print("{s}: CONFLICT held by {s}\n", .{ norm, holder });
+            } else {
+                if (ctx.livelog) |lv| lv.coordEvent("claim", norm, ctx.depth);
+                try out.writer().print("{s}: ok\n", .{norm});
+            }
+        }
+        return try ctx.alloc.dupe(u8, std.mem.trimRight(u8, out.items, "\n"));
+    }
+    if (std.mem.eql(u8, op, "rel")) {
+        const n = if (argStr(args, "pat")) |p0| blk: {
+            const norm = coordNormPat(ctx, p0) catch return "error: bad pat";
+            break :blk co.release(aid, norm);
+        } else co.release(aid, null);
+        return std.fmt.allocPrint(ctx.alloc, "released {d} claim(s)", .{n});
+    }
+    if (std.mem.eql(u8, op, "status")) {
+        const s = try co.status(ctx.scratch, aid);
+        return try ctx.alloc.dupe(u8, s);
+    }
+    if (std.mem.eql(u8, op, "send")) {
+        const to = argStr(args, "to") orelse return "error: send needs to (aid or '*')";
+        const m = argStr(args, "m") orelse return "error: send needs m";
+        co.send(aid, to, m) catch |e| switch (e) {
+            error.UnknownAgent => {
+                const s = co.status(ctx.scratch, aid) catch "";
+                return std.fmt.allocPrint(ctx.alloc, "error: unknown agent '{s}'. {s}", .{ to, s });
+            },
+            else => return e,
+        };
+        if (ctx.livelog) |lv| lv.coordEvent("send", to, ctx.depth);
+        return std.fmt.allocPrint(ctx.alloc, "sent → {s}", .{to});
+    }
+    if (std.mem.eql(u8, op, "poll")) {
+        const s = try co.drain(ctx.scratch, aid);
+        if (s.len == 0) return "no new events";
+        return try ctx.alloc.dupe(u8, s);
+    }
+    if (std.mem.eql(u8, op, "note")) {
+        const m = argStr(args, "m") orelse return "error: note needs m";
+        co.setNote(aid, m);
+        return "note set";
+    }
+    return std.fmt.allocPrint(ctx.alloc, "error: unknown op '{s}' (claim|rel|status|send|poll|note)", .{op});
+}
+
 // ---------- filesystem: delete / mkdir ----------
 
 fn runDelete(ctx: *ToolCtx, args: std.json.Value) ![]const u8 {
@@ -677,6 +816,7 @@ fn runDelete(ctx: *ToolCtx, args: std.json.Value) ![]const u8 {
     writeGuard(ctx, abs) catch {
         return std.fmt.allocPrint(ctx.alloc, "error: {s} is outside the workspace ({s}); denied", .{ abs, ctx.workspace });
     };
+    if (claimConflict(ctx, abs)) |msg| return msg;
     if (std.mem.eql(u8, abs, ctx.workspace)) {
         return "error: refusing to delete the workspace root itself";
     }
@@ -706,6 +846,7 @@ fn runMakeDir(ctx: *ToolCtx, args: std.json.Value) ![]const u8 {
     writeGuard(ctx, abs) catch {
         return std.fmt.allocPrint(ctx.alloc, "error: {s} is outside the workspace ({s}); denied", .{ abs, ctx.workspace });
     };
+    if (claimConflict(ctx, abs)) |msg| return msg;
     try std.fs.cwd().makePath(abs);
     return std.fmt.allocPrint(ctx.alloc, "created {s}", .{abs});
 }

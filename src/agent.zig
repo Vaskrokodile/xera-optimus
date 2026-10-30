@@ -8,6 +8,7 @@ const harness = @import("harness.zig");
 const session = @import("session.zig");
 const hooks_mod = @import("hooks.zig");
 const live = @import("live.zig");
+const coord_mod = @import("coord.zig");
 
 pub const Ui = tools.Ui;
 
@@ -42,6 +43,13 @@ pub const Agent = struct {
     hooks_loaded: bool = false,
     /// set externally to request a graceful stop at the next loop boundary
     interrupted: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// shared-session coordination fabric (claims, feed, inbox); null when
+    /// the agent isn't attached to a session (plain exec/improve runs)
+    coord: ?*coord_mod.Coordinator = null,
+    /// this agent's id inside the coordinator ("main", "t-1", "main/s")
+    aid: []const u8 = "",
+    /// whether the coordinator join + protocol intro already happened
+    coord_joined: bool = false,
 
     pub fn init(
         alloc: std.mem.Allocator,
@@ -129,10 +137,45 @@ pub const Agent = struct {
         return outcome;
     }
 
+    /// One-time coordinator join: pick an aid, register, inject the
+    /// compact protocol briefing so the model knows the rules.
+    fn coordSetup(self: *Agent) !void {
+        const co = self.coord orelse return;
+        if (self.coord_joined) return;
+        self.coord_joined = true;
+        if (self.aid.len == 0) self.aid = "main";
+        co.register(self.aid);
+        try self.messages.append(try llm.systemMessage(self.alloc,
+            try std.fmt.allocPrint(self.alloc,
+                "<coord> shared session — you are agent '{s}'. Sibling agents (threads, subagents) work this same workspace.\n" ++
+                "1) claim before you write: coord{{op:\"claim\",pat:\"src/*.zig\"}} — writes into paths claimed by others are refused.\n" ++
+                "2) claims persist until coord{{op:\"rel\"}} or ~10min expiry — release when done.\n" ++
+                "3) coord{{op:\"status\"}} = roster · coord{{op:\"send\",to:\"aid\"|\"*\",m:\"...\"}} = message (keep m to facts/paths, no prose).\n" ++
+                "4) <sync> messages push the event feed between your turns: seq|kind|from|data — " ++
+                "k: b=turn-start e=turn-end w=write $=shell c=claim r=release !=contention m=msg n=note +=join.</coord>",
+                .{self.aid})));
+    }
+
+    /// Push-delivery: drain feed + inbox and inject as a <sync> system
+    /// message. Runs before every model call so the model can't forget.
+    fn syncCoord(self: *Agent) !void {
+        const co = self.coord orelse return;
+        const lines = try co.drain(self.alloc, self.aid);
+        if (lines.len == 0) return;
+        const m = try std.fmt.allocPrint(self.alloc, "<sync>\n{s}</sync>",
+            .{std.mem.trimRight(u8, lines, "\n")});
+        try self.messages.append(try llm.systemMessage(self.alloc, m));
+    }
+
     /// Continue the loop with whatever is already in history.
     pub fn loop(self: *Agent) !RunOutcome {
         // c8: Stop fires when the tool loop exits for any reason
         defer _ = self.fireHook("Stop", "{\"event\":\"Stop\"}", "");
+        try self.coordSetup();
+        if (self.coord) |co| {
+            co.emit("b", self.aid, "");
+            defer co.emit("e", self.aid, "");
+        }
         var iters: usize = 0;
         var last_text: []const u8 = "";
         var stop_reason: []const u8 = "stop";
@@ -143,6 +186,7 @@ pub const Agent = struct {
             }
             iters += 1;
             try self.compactIfNeeded();
+            try self.syncCoord();
 
             const on_delta = self.makeDeltaCb();
             const on_reason = self.makeReasoningCb();
@@ -273,6 +317,8 @@ pub const Agent = struct {
             try self.trajTool(t.name, summary, msg);
             return msg;
         };
+        // free awareness for siblings: successful writes land on the feed
+        tools.emitWriteEvent(&tctx, t.name, args, out);
         // c8 PostToolUse hook — feedback is appended as context the model sees
         const post_payload = try std.fmt.allocPrint(scratch,
             "{{\"event\":\"PostToolUse\",\"tool_name\":\"{s}\",\"cwd\":\"{s}\"}}",
@@ -302,6 +348,8 @@ pub const Agent = struct {
             .livelog = self.livelog,
             .always_allow = self.always_allow,
             .subagent_run = subagentRun,
+            .coord = self.coord,
+            .aid = self.aid,
         };
     }
 
@@ -379,6 +427,12 @@ pub const Agent = struct {
         sub.approver = tctx.approver;
         sub.ui = tctx.ui;
         sub.livelog = tctx.livelog;
+        // join the shared fabric as a child of this agent ("main" -> "main/s")
+        sub.coord = tctx.coord;
+        sub.aid = if (tctx.aid.len > 0)
+            try std.fmt.allocPrint(aalloc, "{s}/s", .{tctx.aid})
+        else
+            "s";
         if (tctx.always_allow) |aa| sub.always_allow = aa;
         _ = sub.fireHook("SubagentStart", "{\"event\":\"SubagentStart\"}", "");
         const outcome = try sub.runTask(prompt);
