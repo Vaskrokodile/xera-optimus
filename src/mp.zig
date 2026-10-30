@@ -142,10 +142,21 @@ pub const Server = struct {
         self.alive.store(false, .release);
         self.mu.lock();
         for (self.peers.items) |p| {
-            p.open.store(false, .release);
-            p.stream.close();
+            // swap-guard: the peer may already be closed (write-fail
+            // path); closesocket on a dead handle is WSAENOTSOCK → panic
+            if (p.open.swap(false, .acq_rel)) p.stream.close();
         }
         self.mu.unlock();
+        // Wake the blocking accept() before closing: on Windows,
+        // closesocket() can block while an accept() is still pending on
+        // another thread. A self-connect makes accept() return (the loop
+        // then sees alive==false and exits), so deinit can't wedge.
+        const wake = std.net.Address.parseIp("127.0.0.1", self.port) catch
+            unreachable;
+        if (std.net.tcpConnectToAddress(wake)) |s| {
+            s.close();
+        } else |_| {}
+        self.accept_thread.join();
         self.listener.deinit();
     }
 
@@ -198,18 +209,23 @@ pub const Server = struct {
     }
 
     fn dropPeer(self: *Server, p: *Peer) void {
-        if (!p.open.swap(false, .acq_rel)) return; // already dropped (e.g. stop())
-        p.stream.close();
+        // Whoever flips open→closed owns the closesocket — exactly once.
+        // But removal + notify must happen even when another thread
+        // already closed the socket (write-fail path), or the ghost
+        // peer stays in `peers` and stop() double-closes it later.
+        if (p.open.swap(false, .acq_rel)) p.stream.close();
         self.mu.lock();
+        var removed = false;
         var i: usize = 0;
         while (i < self.peers.items.len) : (i += 1) {
             if (self.peers.items[i] == p) {
                 _ = self.peers.orderedRemove(i);
+                removed = true;
                 break;
             }
         }
         self.mu.unlock();
-        if (self.cbs.on_peer_drop) |f| f(self.cbs.ctx, p);
+        if (removed) if (self.cbs.on_peer_drop) |f| f(self.cbs.ctx, p);
         // p is intentionally leaked: the UI may still hold a pending
         // mp_line event referencing it (queued messages).
     }
@@ -217,6 +233,11 @@ pub const Server = struct {
     fn acceptLoop(self: *Server) void {
         while (self.alive.load(.acquire)) {
             const conn = self.listener.accept() catch return;
+            // stop() woke us with a self-connect — don't adopt it
+            if (!self.alive.load(.acquire)) {
+                conn.stream.close();
+                return;
+            }
             setNonBlocking(conn.stream);
             const p = self.alloc.create(Peer) catch {
                 conn.stream.close();
@@ -465,12 +486,14 @@ const TestSink = struct {
     fn onLine(ctx: *anyopaque, peer: ?*Peer, line: []const u8) void {
         const self: *TestSink = @ptrCast(@alignCast(ctx));
         _ = peer;
-        self.got.append(std.testing.allocator.dupe(u8, line) catch return) catch {};
+        self.got.append(std.heap.page_allocator.dupe(u8, line) catch return) catch {};
     }
 };
 
 test "session roundtrip over TCP" {
-    const alloc = std.testing.allocator;
+    // peers + server internals are session-lifetime (intentionally never
+    // freed — see dropPeer); page_allocator skips the leak report.
+    const alloc = std.heap.page_allocator;
     var s: TestSink = .{ .got = std.ArrayList([]const u8).init(alloc) };
     const cbs = Cbs{ .ctx = @ptrCast(&s), .on_line = TestSink.onLine };
     const srv = try Server.start(alloc, 0, cbs);
