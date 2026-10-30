@@ -52,6 +52,113 @@ pub const ToolCtx = struct {
     aid: []const u8 = "",
     /// supermemory client; null when no api key is configured
     memory: ?*memory_mod.Memory = null,
+    /// background shells owned by this agent (run_shell background:true)
+    shells: ?*Shells = null,
+    /// async subagents spawned by `task op=spawn`
+    subs: ?*SubRegistry = null,
+    /// notices delivered into the agent's next <sync> block
+    notices: ?*NoticeQueue = null,
+    /// persistent per-agent goal (goal tool)
+    goal_state: ?*GoalState = null,
+    /// pending refinement request (refine tool, runs at turn end)
+    refine_req: ?*RefineReq = null,
+    /// explicit aid for a spawned subagent ("parent/sub-3")
+    sub_aid: ?[]const u8 = null,
+};
+
+/// Events pushed to the agent between iterations — rendered into the
+/// same <sync> block as coord feed/inbox lines.
+pub const NoticeQueue = struct {
+    mu: std.Thread.Mutex = .{},
+    items: std.ArrayList([]const u8),
+
+    pub fn init(alloc: std.mem.Allocator) NoticeQueue {
+        return .{ .items = std.ArrayList([]const u8).init(alloc) };
+    }
+    pub fn push(self: *NoticeQueue, alloc: std.mem.Allocator, msg: []const u8) void {
+        const copy = alloc.dupe(u8, msg) catch return;
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.items.append(copy) catch {};
+    }
+    /// Take all pending notices (caller keeps the slice).
+    pub fn drain(self: *NoticeQueue) [][]const u8 {
+        self.mu.lock();
+        defer self.mu.unlock();
+        const out = self.items.toOwnedSlice() catch return &.{};
+        self.items.clearRetainingCapacity();
+        return out;
+    }
+};
+
+/// One background shell: the process runs detached, output streams into
+/// out/err under the mutex, and a "[shell-done]" notice fires on exit.
+pub const BgShell = struct {
+    id: []const u8,
+    command: []const u8,
+    mu: std.Thread.Mutex = .{},
+    out: std.ArrayList(u8),
+    err: std.ArrayList(u8),
+    done: bool = false,
+    code: i64 = -1,
+    child: ?*std.process.Child = null,
+    started_ms: i64 = 0,
+};
+
+pub const Shells = struct {
+    alloc: std.mem.Allocator,
+    mu: std.Thread.Mutex = .{},
+    map: std.StringHashMap(*BgShell),
+    next: u32 = 1,
+    notices: ?*NoticeQueue = null,
+
+    pub fn init(alloc: std.mem.Allocator, notices: ?*NoticeQueue) Shells {
+        return .{
+            .alloc = alloc,
+            .map = std.StringHashMap(*BgShell).init(alloc),
+            .notices = notices,
+        };
+    }
+};
+
+/// One spawned (async) subagent tracked by its parent.
+pub const BgSub = struct {
+    aid: []const u8, // "parent/sub-N"
+    title: []const u8,
+    mu: std.Thread.Mutex = .{},
+    done: bool = false,
+    result: []const u8 = "",
+    is_err: bool = false,
+    started_ms: i64 = 0,
+};
+
+pub const SubRegistry = struct {
+    alloc: std.mem.Allocator,
+    mu: std.Thread.Mutex = .{},
+    map: std.StringHashMap(*BgSub),
+    next: u32 = 1,
+
+    pub fn init(alloc: std.mem.Allocator) SubRegistry {
+        return .{ .alloc = alloc, .map = std.StringHashMap(*BgSub).init(alloc) };
+    }
+};
+
+/// Persistent per-agent objective, injected into every sync block while
+/// active. The coord map mirrors it for `status`; this is the source an
+/// agent injects from (works with or without a coordinator).
+pub const GoalState = struct {
+    mu: std.Thread.Mutex = .{},
+    objective: []const u8 = "",
+    set_ms: i64 = 0,
+    turns: u32 = 0,
+};
+
+/// A refine request scheduled by the `refine` tool — the host runs it
+/// when the turn ends (never mid-turn), like prime-agent's refine.run().
+pub const RefineReq = struct {
+    mu: std.Thread.Mutex = .{},
+    pending: ?[]const u8 = null,
+    scope_global: bool = false,
 };
 
 pub const Tool = struct {
@@ -156,8 +263,8 @@ pub const tools = [_]Tool{
     },
     .{
         .name = "run_shell",
-        .description = "Run a shell command in the workspace (cmd /c on Windows, /bin/sh -c elsewhere). Returns stdout, stderr, and exit code. timeout_ms optional (default 120s).",
-        .schema_src = \\{"type":"object","properties":{"command":{"type":"string"},"timeout_ms":{"type":"integer"},"cwd":{"type":"string"}},"required":["command"]}
+        .description = "Run a shell command in the workspace (cmd /c on Windows, /bin/sh -c elsewhere). Foreground: returns stdout, stderr, exit code (timeout_ms, default 120s). background:true returns a shell id immediately — use it for servers/watchers/long builds; a [shell-done] notice arrives on exit. Manage with {id: sh-N} snapshot, {id, wait_ms} block-for-finish, {id, kill:true}.",
+        .schema_src = \\{"type":"object","properties":{"command":{"type":"string"},"timeout_ms":{"type":"integer"},"cwd":{"type":"string"},"background":{"type":"boolean"},"id":{"type":"string"},"wait_ms":{"type":"integer"},"kill":{"type":"boolean"}}}
         ,
         .danger = .shell,
         .run = runShell,
@@ -183,8 +290,8 @@ pub const tools = [_]Tool{
     },
     .{
         .name = "task",
-        .description = "Delegate a self-contained subtask to a subagent with fresh context and the same harness. Give complete context in the prompt — it cannot see this conversation. Optional `agent` selects a named persona from sub_agents/<name>/AGENT.md.",
-        .schema_src = \\{"type":"object","properties":{"prompt":{"type":"string"},"title":{"type":"string"},"agent":{"type":"string","description":"optional persona name from harness sub_agents/<name>/AGENT.md"}},"required":["prompt"]}
+        .description = "Delegate a self-contained subtask to a subagent with fresh context and the same harness. Give complete context in the prompt — it cannot see this conversation. Optional `agent` selects a named persona from sub_agents/<name>/AGENT.md. op=run (default): blocking. op=spawn: async — returns a handle ('<aid>/sub-N'); the report lands in your inbox on completion. op=collect: results (id optional, wait_ms to block). op=list: spawned subagents' status.",
+        .schema_src = \\{"type":"object","properties":{"op":{"type":"string","enum":["run","spawn","collect","list"]},"prompt":{"type":"string"},"title":{"type":"string"},"agent":{"type":"string","description":"optional persona name from harness sub_agents/<name>/AGENT.md"},"id":{"type":"string"},"wait_ms":{"type":"integer"}}}
         ,
         .danger = .safe,
         .run = runTask,
@@ -206,6 +313,24 @@ pub const tools = [_]Tool{
         ,
         .danger = .safe,
         .run = runMemory,
+        .summary = sumMem,
+    },
+    .{
+        .name = "goal",
+        .description = "Persistent objective kept in context until done — the harness re-surfaces it every turn. op: set(objective=what you must fully accomplish) · get · complete (objective actually achieved — required to end it) · clear. Set one for long multi-turn work; complete it honestly.",
+        .schema_src = \\{"type":"object","properties":{"op":{"type":"string","enum":["set","get","complete","clear"]},"objective":{"type":"string"}},"required":["op"]}
+        ,
+        .danger = .safe,
+        .run = runGoal,
+        .summary = sumMem,
+    },
+    .{
+        .name = "refine",
+        .description = "Schedule continual-harness refinement: a separate model pass reviews this trajectory and applies small evidence-backed edits to harness files (memory.md, lessons.md, guardrails.md, tool_guidance.md, skills/, sub_agents/). Runs at turn end; result arrives in the next sync. Use after a repeated failure, reusable tactic, or policy worth persisting — not for one-off noise. global=true targets the global (cross-workspace) harness.",
+        .schema_src = \\{"type":"object","properties":{"instructions":{"type":"string"},"global":{"type":"boolean"}}}
+        ,
+        .danger = .safe,
+        .run = runRefine,
         .summary = sumMem,
     },
 };
@@ -328,7 +453,8 @@ fn sumCoord(ctx: *ToolCtx, args: std.json.Value) []const u8 {
 
 fn sumMem(ctx: *ToolCtx, args: std.json.Value) []const u8 {
     const op = argStr(args, "op") orelse return "?";
-    const extra = argStr(args, "q") orelse argStr(args, "m") orelse argStr(args, "ids") orelse "";
+    const extra = argStr(args, "q") orelse argStr(args, "m") orelse argStr(args, "ids") orelse
+        argStr(args, "objective") orelse argStr(args, "instructions") orelse "";
     const short = util.truncateMiddle(ctx.scratch, extra, 60) catch extra;
     return std.fmt.allocPrint(ctx.scratch, "{s} {s}", .{ op, short }) catch op;
 }
@@ -622,9 +748,28 @@ const PipeRead = struct {
     file: std.fs.File,
     list: *std.ArrayList(u8),
     max: usize,
+    /// optional lock for live tails while a background process streams
+    mu: ?*std.Thread.Mutex = null,
 
     fn run(self: PipeRead) void {
-        self.file.reader().readAllArrayList(self.list, self.max) catch {};
+        const mu = self.mu orelse {
+            self.file.reader().readAllArrayList(self.list, self.max) catch {};
+            return;
+        };
+        // chunk loop: lock per chunk so mid-run `out` snapshots stay safe.
+        // Past the cap we keep draining so the child never blocks on a
+        // full pipe — output just stops accumulating.
+        var buf: [8192]u8 = undefined;
+        while (true) {
+            const n = self.file.read(&buf) catch break;
+            if (n == 0) break;
+            mu.lock();
+            if (self.list.items.len < self.max) {
+                const room = self.max - self.list.items.len;
+                self.list.appendSlice(buf[0..@min(room, n)]) catch {};
+            }
+            mu.unlock();
+        }
     }
 };
 
@@ -645,16 +790,9 @@ const KillWatch = struct {
     }
 };
 
-fn runShell(ctx: *ToolCtx, args: std.json.Value) ![]const u8 {
-    const command = argStr(args, "command") orelse return "error: missing command";
-    const timeout_ms: u64 = @intCast(@max(1000, util.jint(args, "timeout_ms") orelse 120_000));
-    var run_cwd = ctx.cwd;
-    if (argStr(args, "cwd")) |c| {
-        run_cwd = try util.resolvePath(ctx.scratch, ctx.cwd, c);
-    }
-
+fn buildArgv(alloc: std.mem.Allocator, ctx: *ToolCtx, command: []const u8) ![][]const u8 {
     const builtin = @import("builtin");
-    var argv = std.ArrayList([]const u8).init(ctx.scratch);
+    var argv = std.ArrayList([]const u8).init(alloc);
     if (builtin.os.tag == .windows) {
         if (ctx.cfg.shell) |sh| {
             try argv.append(sh);
@@ -670,8 +808,171 @@ fn runShell(ctx: *ToolCtx, args: std.json.Value) ![]const u8 {
         try argv.append("-c");
         try argv.append(command);
     }
+    return argv.toOwnedSlice();
+}
 
-    var child = std.process.Child.init(argv.items, ctx.scratch);
+/// Detached worker for run_shell{background:true}: spawns, streams
+/// output into the handle, publishes the result, then pushes a
+/// [shell-done] notice the agent sees at the next sync boundary.
+const BgJob = struct {
+    sh: *BgShell,
+    reg: *Shells,
+    argv: [][]const u8,
+    cwd: []const u8,
+};
+
+fn bgShellMain(job: *BgJob) void {
+    const alloc = job.reg.alloc;
+    var child = std.process.Child.init(job.argv, alloc);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+    child.cwd = job.cwd;
+    child.spawn() catch |e| {
+        job.sh.mu.lock();
+        job.sh.done = true;
+        job.sh.code = -1;
+        job.sh.err.writer().print("spawn failed: {s}", .{@errorName(e)}) catch {};
+        job.sh.mu.unlock();
+        bgShellNotice(job);
+        return;
+    };
+    job.sh.child = &child;
+    const t_out = std.Thread.spawn(.{}, PipeRead.run, .{PipeRead{
+        .file = child.stdout.?, .list = &job.sh.out, .max = 4 << 20, .mu = &job.sh.mu,
+    }}) catch return;
+    const t_err = std.Thread.spawn(.{}, PipeRead.run, .{PipeRead{
+        .file = child.stderr.?, .list = &job.sh.err, .max = 4 << 20, .mu = &job.sh.mu,
+    }}) catch return;
+    const term = child.wait() catch {
+        job.sh.mu.lock();
+        job.sh.done = true;
+        job.sh.code = -1;
+        job.sh.mu.unlock();
+        bgShellNotice(job);
+        return;
+    };
+    t_out.join();
+    t_err.join();
+    job.sh.mu.lock();
+    job.sh.done = true;
+    job.sh.code = switch (term) {
+        .Exited => |c| @intCast(c),
+        else => -1,
+    };
+    job.sh.mu.unlock();
+    bgShellNotice(job);
+}
+
+fn bgShellNotice(job: *BgJob) void {
+    const reg = job.reg;
+    const nq = reg.notices orelse return;
+    const tail = blk: {
+        job.sh.mu.lock();
+        defer job.sh.mu.unlock();
+        const o = job.sh.out.items;
+        const t = if (o.len > 300) o[o.len - 300 ..] else o;
+        break :blk util.firstLine(t);
+    };
+    const msg = std.fmt.allocPrint(reg.alloc, "[shell-done {s} exit {d}] {s}", .{
+        job.sh.id, job.sh.code, tail,
+    }) catch return;
+    nq.push(reg.alloc, msg);
+}
+
+fn runShell(ctx: *ToolCtx, args: std.json.Value) ![]const u8 {
+    // ---- manage an existing background shell ----
+    if (argStr(args, "id")) |id| {
+        const reg = ctx.shells orelse return "error: no shell registry on this agent";
+        reg.mu.lock();
+        const sh = reg.map.get(id);
+        reg.mu.unlock();
+        const s = sh orelse return std.fmt.allocPrint(ctx.alloc, "error: no shell '{s}'", .{id});
+
+        var kill = false;
+        if (util.jget(args, "kill")) |k| {
+            if (k == .bool) kill = k.bool;
+        }
+        if (kill) {
+            s.mu.lock();
+            const running = !s.done;
+            const c = s.child;
+            s.mu.unlock();
+            if (running and c != null) _ = c.?.kill() catch {};
+            return std.fmt.allocPrint(ctx.alloc, "{s} kill requested", .{id});
+        }
+
+        const wait_ms: i64 = @intCast(@max(0, util.jint(args, "wait_ms") orelse 0));
+        const deadline = std.time.milliTimestamp() + wait_ms;
+        while (true) {
+            s.mu.lock();
+            const d = s.done;
+            s.mu.unlock();
+            if (d or std.time.milliTimestamp() >= deadline) break;
+            std.time.sleep(25 * std.time.ns_per_ms);
+        }
+
+        s.mu.lock();
+        defer s.mu.unlock();
+        const age_s = @divTrunc(std.time.milliTimestamp() - s.started_ms, 1000);
+        const out_t = try util.truncateMiddle(ctx.scratch, s.out.items, 20_000);
+        const err_t = try util.truncateMiddle(ctx.scratch, s.err.items, 8_000);
+        if (!s.done) {
+            return std.fmt.allocPrint(ctx.alloc, "{s} still running ({d}s)\n--- stdout ---\n{s}\n--- stderr ---\n{s}", .{ s.id, age_s, out_t, err_t });
+        }
+        return std.fmt.allocPrint(ctx.alloc, "{s} exit {d} ({d}s)\n--- stdout ---\n{s}\n--- stderr ---\n{s}", .{ s.id, s.code, age_s, out_t, err_t });
+    }
+
+    const command = argStr(args, "command") orelse return "error: missing command (or pass id)";
+    const timeout_ms: u64 = @intCast(@max(1000, util.jint(args, "timeout_ms") orelse 120_000));
+    var run_cwd = ctx.cwd;
+    if (argStr(args, "cwd")) |c| {
+        run_cwd = try util.resolvePath(ctx.scratch, ctx.cwd, c);
+    }
+
+    var background = false;
+    if (util.jget(args, "background")) |b| {
+        if (b == .bool) background = b.bool;
+    }
+
+    // ---- background: detached process + handle ----
+    if (background) {
+        const reg = ctx.shells orelse return "error: background shells unavailable on this agent";
+        const a = reg.alloc; // page_allocator — thread-safe, session lifetime
+        const sh = try a.create(BgShell);
+        const command_copy = try a.dupe(u8, command);
+        sh.* = .{
+            .id = undefined,
+            .command = command_copy,
+            .out = std.ArrayList(u8).init(a),
+            .err = std.ArrayList(u8).init(a),
+            .started_ms = std.time.milliTimestamp(),
+        };
+        reg.mu.lock();
+        sh.id = try std.fmt.allocPrint(a, "sh-{d}", .{reg.next});
+        reg.next += 1;
+        try reg.map.put(try a.dupe(u8, sh.id), sh);
+        reg.mu.unlock();
+
+        const job = try a.create(BgJob);
+        job.* = .{
+            .sh = sh,
+            .reg = reg,
+            .argv = try buildArgv(a, ctx, command_copy),
+            .cwd = try a.dupe(u8, run_cwd),
+        };
+        const th = std.Thread.spawn(.{}, bgShellMain, .{job}) catch |e| {
+            return std.fmt.allocPrint(ctx.alloc, "error: spawn thread failed: {s}", .{@errorName(e)});
+        };
+        th.detach();
+        if (ctx.livelog) |lv| lv.event("shell", "spawn", util.firstLine(command), ctx.depth);
+        if (ctx.coord) |co| co.emit("S", ctx.aid, std.fmt.allocPrint(ctx.scratch, "{s} bg {s}", .{ sh.id, util.firstLine(command) }) catch sh.id);
+        return std.fmt.allocPrint(ctx.alloc, "{s} running (background). You'll get [shell-done] on exit; check with run_shell{{id:\"{s}\"}} or wait.", .{ sh.id, sh.id });
+    }
+
+    // ---- foreground ----
+    const argv = try buildArgv(ctx.scratch, ctx, command);
+    var child = std.process.Child.init(argv, ctx.scratch);
     child.stdin_behavior = .Ignore;
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Pipe;
@@ -745,11 +1046,190 @@ fn runSkillLoad(ctx: *ToolCtx, args: std.json.Value) ![]const u8 {
 }
 
 fn runTask(ctx: *ToolCtx, args: std.json.Value) ![]const u8 {
-    if (ctx.depth >= 2) return "error: subagent depth limit reached";
-    const prompt = argStr(args, "prompt") orelse return "error: missing prompt";
-    const agent_name = argStr(args, "agent");
-    const runner = ctx.subagent_run orelse return "error: subagents unavailable";
-    return runner(ctx, prompt, agent_name);
+    const op = argStr(args, "op") orelse "run";
+
+    if (std.mem.eql(u8, op, "run")) {
+        if (ctx.depth >= 2) return "error: subagent depth limit reached";
+        const prompt = argStr(args, "prompt") orelse return "error: missing prompt";
+        const agent_name = argStr(args, "agent");
+        const runner = ctx.subagent_run orelse return "error: subagents unavailable";
+        return runner(ctx, prompt, agent_name);
+    }
+
+    if (std.mem.eql(u8, op, "spawn")) {
+        if (ctx.depth >= 2) return "error: subagent depth limit reached";
+        const prompt = argStr(args, "prompt") orelse return "error: spawn needs prompt";
+        const agent_name = argStr(args, "agent");
+        const title = argStr(args, "title") orelse util.firstLine(prompt);
+        const reg = ctx.subs orelse return "error: async subagents unavailable on this agent";
+        const runner = ctx.subagent_run orelse return "error: subagents unavailable";
+        const a = reg.alloc; // page_allocator — safe after the caller returns
+
+        const sub = try a.create(BgSub);
+        const parent = if (ctx.aid.len > 0) ctx.aid else "agent";
+        sub.* = .{
+            .aid = undefined,
+            .title = try a.dupe(u8, title),
+            .started_ms = std.time.milliTimestamp(),
+        };
+
+        // heap-copy the ctx: the parent's stack ctx dies when the call
+        // returns. alloc swaps to the registry's (a depth>0 ctx.alloc is
+        // an arena that dies with the parent's run — page survives).
+        const tctx = try a.create(ToolCtx);
+        tctx.* = ctx.*;
+        tctx.alloc = a;
+        tctx.scratch = a;
+
+        reg.mu.lock();
+        sub.aid = try std.fmt.allocPrint(a, "{s}/sub-{d}", .{ parent, reg.next });
+        reg.next += 1;
+        try reg.map.put(try a.dupe(u8, sub.aid), sub);
+        reg.mu.unlock();
+        tctx.sub_aid = sub.aid;
+        // sub-subs would outlive a transient parent arena — keep async
+        // delegation to channel agents only
+        tctx.subs = null;
+
+        const job = try a.create(SubJob);
+        job.* = .{ .sub = sub, .tctx = tctx, .prompt = try a.dupe(u8, prompt), .agent = agent_name, .runner = runner };
+        const th = std.Thread.spawn(.{}, bgSubMain, .{job}) catch |e| {
+            return std.fmt.allocPrint(ctx.alloc, "error: spawn failed: {s}", .{@errorName(e)});
+        };
+        th.detach();
+        if (ctx.livelog) |lv| lv.subagent(agent_name orelse "sub", util.firstLine(prompt), ctx.depth);
+        if (ctx.coord) |co| co.emit("S", ctx.aid, std.fmt.allocPrint(ctx.scratch, "spawn {s}", .{sub.aid}) catch sub.aid);
+        return std.fmt.allocPrint(ctx.alloc, "spawned {s} — result arrives in your inbox; check with task{{op:\"collect\",id:\"{s}\"}}", .{ sub.aid, sub.aid });
+    }
+
+    if (std.mem.eql(u8, op, "list") or std.mem.eql(u8, op, "collect")) {
+        const reg = ctx.subs orelse return "error: async subagents unavailable on this agent";
+        const want_id = argStr(args, "id");
+        const wait_ms: i64 = if (std.mem.eql(u8, op, "list")) 0 else @intCast(@max(0, util.jint(args, "wait_ms") orelse 0));
+        const deadline = std.time.milliTimestamp() + wait_ms;
+
+        var out = std.ArrayList(u8).init(ctx.scratch);
+        while (true) {
+            out.clearRetainingCapacity();
+            var pending: usize = 0;
+            var matched: usize = 0;
+            reg.mu.lock();
+            var it = reg.map.iterator();
+            while (it.next()) |kv| {
+                const s = kv.value_ptr.*;
+                if (want_id) |w| {
+                    if (!std.mem.eql(u8, s.aid, w) and !std.mem.eql(u8, kv.key_ptr.*, w)) continue;
+                }
+                matched += 1;
+                s.mu.lock();
+                const status: []const u8 = if (!s.done) "running" else if (s.is_err) "error" else "done";
+                if (!s.done) pending += 1;
+                try out.writer().print("{s} [{s}] {s}", .{ s.aid, status, s.title });
+                if (s.done and s.result.len > 0) {
+                    const r = try util.truncateMiddle(ctx.scratch, s.result, 3000);
+                    try out.writer().print("\n--- result ---\n{s}\n---\n", .{r});
+                }
+                s.mu.unlock();
+                try out.append('\n');
+            }
+            reg.mu.unlock();
+
+            if (want_id != null and matched == 0)
+                return std.fmt.allocPrint(ctx.alloc, "error: no spawned subagent '{s}'", .{want_id.?});
+            if (matched == 0) return "(no spawned subagents)";
+            if (pending == 0 or std.time.milliTimestamp() >= deadline) break;
+            std.time.sleep(25 * std.time.ns_per_ms);
+        }
+        return try ctx.alloc.dupe(u8, std.mem.trimRight(u8, out.items, "\n"));
+    }
+
+    return std.fmt.allocPrint(ctx.alloc, "error: unknown op '{s}' (run|spawn|collect|list)", .{op});
+}
+
+/// Detached worker for task op=spawn: runs the full subagent loop and
+/// publishes the report — into the parent's notices and its inbox.
+const SubJob = struct {
+    sub: *BgSub,
+    tctx: *ToolCtx,
+    prompt: []const u8,
+    agent: ?[]const u8,
+    runner: *const fn (ctx: *ToolCtx, prompt: []const u8, agent_name: ?[]const u8) anyerror![]const u8,
+};
+
+fn bgSubMain(job: *SubJob) void {
+    const a = job.tctx.alloc;
+    const res = job.runner(job.tctx, job.prompt, job.agent) catch |e| blk: {
+        job.sub.is_err = true;
+        break :blk std.fmt.allocPrint(a, "(subagent failed: {s})", .{@errorName(e)}) catch "";
+    };
+    job.sub.mu.lock();
+    job.sub.result = res;
+    job.sub.done = true;
+    job.sub.mu.unlock();
+
+    const first = util.firstLine(res);
+    const tail = if (first.len > 200) first[0..200] else first;
+    const msg = std.fmt.allocPrint(a, "[sub-done {s}{s}] {s}", .{
+        job.sub.aid, if (job.sub.is_err) " error" else "", tail,
+    }) catch return;
+    if (job.tctx.notices) |nq| nq.push(a, msg);
+    if (job.tctx.coord) |co| {
+        co.emit("S", job.sub.aid, "done");
+        co.send(job.sub.aid, job.tctx.aid, msg) catch {};
+    }
+}
+
+fn runGoal(ctx: *ToolCtx, args: std.json.Value) ![]const u8 {
+    const gs = ctx.goal_state orelse return "error: goals unavailable on this agent";
+    const op = argStr(args, "op") orelse return "error: missing op";
+
+    if (std.mem.eql(u8, op, "set")) {
+        const obj = argStr(args, "objective") orelse return "error: set needs objective";
+        const copy = try ctx.alloc.dupe(u8, obj);
+        gs.mu.lock();
+        gs.objective = copy;
+        gs.set_ms = std.time.milliTimestamp();
+        gs.turns = 0;
+        gs.mu.unlock();
+        if (ctx.coord) |co| co.setGoal(ctx.aid, obj);
+        if (ctx.livelog) |lv| lv.memEvent("goal_set", util.firstLine(obj), ctx.depth);
+        return std.fmt.allocPrint(ctx.alloc, "goal set: {s}\n(it re-surfaces every turn until you `goal complete`)", .{obj});
+    }
+    if (std.mem.eql(u8, op, "get")) {
+        gs.mu.lock();
+        defer gs.mu.unlock();
+        if (gs.objective.len == 0) return "(no active goal)";
+        return std.fmt.allocPrint(ctx.alloc, "goal: {s} ({d} turns)", .{ gs.objective, gs.turns });
+    }
+    if (std.mem.eql(u8, op, "complete") or std.mem.eql(u8, op, "clear")) {
+        gs.mu.lock();
+        const had = gs.objective.len > 0;
+        gs.objective = "";
+        gs.turns = 0;
+        gs.mu.unlock();
+        if (ctx.coord) |co| co.setGoal(ctx.aid, null);
+        if (ctx.livelog) |lv| lv.memEvent(if (had) "goal_done" else "goal_clear", "", ctx.depth);
+        return if (had)
+            (if (std.mem.eql(u8, op, "complete")) "goal completed" else "goal cleared")
+        else
+            "(no active goal)";
+    }
+    return std.fmt.allocPrint(ctx.alloc, "error: unknown op '{s}' (set|get|complete|clear)", .{op});
+}
+
+fn runRefine(ctx: *ToolCtx, args: std.json.Value) ![]const u8 {
+    const req = ctx.refine_req orelse return "error: refinement unavailable on this agent";
+    const instr = argStr(args, "instructions") orelse "";
+    var glob = false;
+    if (util.jget(args, "global")) |g| {
+        if (g == .bool) glob = g.bool;
+    }
+    req.mu.lock();
+    req.pending = if (instr.len > 0) try ctx.alloc.dupe(u8, instr) else "";
+    req.scope_global = glob;
+    req.mu.unlock();
+    if (ctx.livelog) |lv| lv.memEvent("refine_sched", util.firstLine(instr), ctx.depth);
+    return "refinement scheduled — it runs when this turn ends and applies evidence-backed edits to the harness";
 }
 
 // ---------- coordination ----------

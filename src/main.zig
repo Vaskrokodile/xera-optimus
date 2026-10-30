@@ -12,6 +12,7 @@ const improve = @import("improve.zig");
 const repl = @import("repl.zig");
 const tui_app = @import("tui_app.zig");
 const memory_mod = @import("memory.zig");
+const refine_mod = @import("refine.zig");
 
 const version = "0.1.0";
 
@@ -23,6 +24,7 @@ const usage_text =
     \\  xera-optimus [flags]                 interactive session
     \\  xera-optimus exec [flags] <prompt>   one-shot run, then exit
     \\  xera-optimus improve [flags] <task>  Harness² propose-probe-compose on a task
+    \\  xera-optimus refine <instructions>   refine the harness from the latest session
     \\  xera-optimus harness [show|path]     inspect the editable harness
     \\  xera-optimus sessions                list saved sessions
     \\  xera-optimus resume <id>             resume a session interactively
@@ -146,7 +148,7 @@ pub fn main() !u8 {
     }
 
     // first positional is the subcommand when it matches a known one
-    const subcommands = [_][]const u8{ "chat", "exec", "improve", "harness", "sessions", "resume", "doctor", "config", "version", "help" };
+    const subcommands = [_][]const u8{ "chat", "exec", "improve", "refine", "harness", "sessions", "resume", "doctor", "config", "version", "help" };
     if (parsed.positional.items.len > 0) {
         const first = parsed.positional.items[0];
         for (subcommands) |s| {
@@ -211,6 +213,9 @@ pub fn main() !u8 {
             try repl.replLoop(alloc, &cfg, &hclient, &h, cwd, msgs);
         }
         return 0;
+    }
+    if (std.mem.eql(u8, cmd, "refine")) {
+        return cmdRefine(alloc, &cfg, &hclient, &h, cwd, rest);
     }
     if (std.mem.eql(u8, cmd, "exec")) {
         if (rest.len == 0) {
@@ -294,6 +299,53 @@ fn cmdExec(
         std.debug.print("\n", .{});
     }
     std.debug.print("(session {s})\n", .{log.id});
+    return 0;
+}
+
+/// `xera-optimus refine [--global] <instructions>` — run the continual-
+/// harness refinement pass against the latest session transcript.
+/// Local scope (workspace harness) by default; --global targets
+/// ~/.xera-optimus/harness.
+fn cmdRefine(
+    alloc: std.mem.Allocator,
+    cfg: *const config.Config,
+    hclient: *http.HttpClient,
+    h: *harness.Harness,
+    cwd: []const u8,
+    rest: []const []const u8,
+) !u8 {
+    _ = cwd;
+    var glob = false;
+    var words = std.ArrayList([]const u8).init(alloc);
+    for (rest) |w| {
+        if (std.mem.eql(u8, w, "--global") or std.mem.eql(u8, w, "-g"))
+            glob = true
+        else
+            try words.append(w);
+    }
+    const instructions = try std.mem.join(alloc, " ", words.items);
+
+    // pick the newest session — it's the trajectory being refined
+    const infos = try session.list(alloc, cfg);
+    if (infos.len == 0) {
+        std.debug.print("no sessions yet — run the agent first\n", .{});
+        return 1;
+    }
+    const msgs = session.loadMessages(alloc, cfg, infos[0].id) catch |e| {
+        std.debug.print("cannot load session {s}: {s}\n", .{ infos[0].id, @errorName(e) });
+        return 1;
+    };
+    std.debug.print("refining harness from session {s} ({d} turns){s}…\n", .{
+        infos[0].id, infos[0].turns, if (glob) " [global]" else "" });
+
+    const summary = refine_mod.run(alloc, cfg, hclient, h, msgs.items, "", .{
+        .instructions = instructions,
+        .scope_global = glob,
+    }) catch |e| {
+        std.debug.print("refine failed: {s}\n", .{@errorName(e)});
+        return 1;
+    };
+    std.debug.print("{s}\n", .{summary});
     return 0;
 }
 

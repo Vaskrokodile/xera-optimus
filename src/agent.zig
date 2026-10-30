@@ -10,6 +10,7 @@ const hooks_mod = @import("hooks.zig");
 const live = @import("live.zig");
 const coord_mod = @import("coord.zig");
 const memory_mod = @import("memory.zig");
+const refine_mod = @import("refine.zig");
 
 pub const Ui = tools.Ui;
 
@@ -59,6 +60,18 @@ pub const Agent = struct {
     mem_doc_id: []const u8 = "",
     /// auto-recall + auto-capture toggle (config memory_auto)
     mem_auto: bool = true,
+    /// background shells (run_shell background:true) owned by this agent.
+    /// Heap-owned: detached workers may write here after the agent's
+    /// stack frame is gone (spawned subs return while shells run on).
+    shells: *tools.Shells,
+    /// async subagents spawned via task op=spawn (same lifetime rule)
+    subs: *tools.SubRegistry,
+    /// pushed notices ([shell-done], [sub-done]) merged into <sync>
+    notices: *tools.NoticeQueue,
+    /// persistent objective re-surfaced each turn (goal tool)
+    goal_state: tools.GoalState = .{},
+    /// scheduled continual-harness refinement (refine tool), runs at turn end
+    refine_req: tools.RefineReq = .{},
 
     pub fn init(
         alloc: std.mem.Allocator,
@@ -89,7 +102,20 @@ pub const Agent = struct {
                 m.* = std.StringHashMap(void).init(alloc);
                 break :blk m;
             },
+            .shells = undefined,
+            .subs = undefined,
+            .notices = undefined,
         };
+        // cross-thread plumbing: heap-owned + page_allocator — detached
+        // shell/sub workers may write to these after this agent's frame
+        // (and its arena) is gone.
+        const pa = std.heap.page_allocator;
+        self.notices = try pa.create(tools.NoticeQueue);
+        self.notices.* = tools.NoticeQueue.init(pa);
+        self.shells = try pa.create(tools.Shells);
+        self.shells.* = tools.Shells.init(pa, self.notices);
+        self.subs = try pa.create(tools.SubRegistry);
+        self.subs.* = tools.SubRegistry.init(pa);
         // c8: SessionStart hook fires once at agent creation
         const pl = try std.fmt.allocPrint(alloc,
             "{{\"event\":\"SessionStart\",\"cwd\":\"{s}\"}}", .{try util.jescape(alloc, cwd)});
@@ -145,6 +171,7 @@ pub const Agent = struct {
         if (self.livelog) |lv| lv.turnEnd(outcome.stop_reason, outcome.iterations,
             self.usage.prompt, self.usage.completion, self.depth);
         self.captureMemory(prompt, author, outcome.text);
+        self.runPendingRefine();
         return outcome;
     }
 
@@ -165,18 +192,66 @@ pub const Agent = struct {
 
     /// Auto-capture: hand the turn to supermemory as an append to this
     /// agent's session document — it extracts/links the memories itself.
-    /// Fire-and-forget.
+    /// Detached: nothing user-visible awaits the network.
     fn captureMemory(self: *Agent, prompt: []const u8, author: []const u8, answer: []const u8) void {
         const mem = self.memory orelse return;
         if (!self.mem_auto or self.mem_doc_id.len == 0) return;
+        const pa = std.heap.page_allocator;
         const who = if (author.len > 0) author else "user";
-        const turn = std.fmt.allocPrint(self.alloc,
-            "{s}: {s}\nassistant[{s}]: {s}", .{ who, prompt, self.aid, answer }) catch return;
-        const meta = std.fmt.allocPrint(self.alloc,
+        const tail = if (answer.len > 8_000) answer[answer.len - 8_000 ..] else answer;
+        const turn = std.fmt.allocPrint(pa,
+            "{s}: {s}\nassistant[{s}]: {s}", .{ who, prompt, self.aid, tail }) catch return;
+        const meta = std.fmt.allocPrint(pa,
             "{{\"src\":\"xera-optimus\",\"agent\":\"{s}\"}}", .{self.aid}) catch return;
-        const out = mem.add(self.alloc, turn, self.mem_doc_id, meta, null) catch return;
+        const job = pa.create(CaptureJob) catch return;
+        job.* = .{ .mem = mem, .doc = self.mem_doc_id, .turn = turn, .meta = meta };
+        const th = std.Thread.spawn(.{}, captureThread, .{job}) catch return;
+        th.detach();
         if (self.livelog) |lv| lv.memEvent("capture", self.mem_doc_id, self.depth);
-        _ = out;
+    }
+
+    const CaptureJob = struct {
+        mem: *memory_mod.Memory,
+        doc: []const u8,
+        turn: []const u8,
+        meta: []const u8,
+    };
+
+    fn captureThread(job: *CaptureJob) void {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        _ = job.mem.add(arena.allocator(), job.turn, job.doc, job.meta, null) catch {};
+        const p = std.heap.page_allocator;
+        p.free(job.turn);
+        p.free(job.meta);
+        p.destroy(job);
+    }
+
+    /// A `refine` tool call schedules refinement; it runs here, at turn
+    /// end — a separate model pass applies evidence-backed harness edits,
+    /// then the result is injected so the next turn sees it.
+    fn runPendingRefine(self: *Agent) void {
+        self.refine_req.mu.lock();
+        const instr = self.refine_req.pending orelse {
+            self.refine_req.mu.unlock();
+            return;
+        };
+        const glob = self.refine_req.scope_global;
+        self.refine_req.pending = null;
+        self.refine_req.mu.unlock();
+
+        const summary = refine_mod.run(self.alloc, self.cfg, self.hclient, self.h,
+            self.messages.items, self.trajectory.items, .{
+                .instructions = instr,
+                .scope_global = glob,
+            }) catch |e|
+            std.fmt.allocPrint(self.alloc, "refine failed: {s}", .{@errorName(e)}) catch "refine failed";
+
+        const note = std.fmt.allocPrint(self.alloc,
+            "[refine{s}] {s}", .{ if (glob) " global" else "", summary }) catch return;
+        self.messages.append(llm.systemMessage(self.alloc, note) catch return) catch return;
+        if (self.coord) |co| co.emit("R", self.aid, summary);
+        if (self.livelog) |lv| lv.memEvent("refine", summary, self.depth);
     }
 
     /// One-time coordinator join: pick an aid, register, inject the
@@ -198,14 +273,35 @@ pub const Agent = struct {
                 .{self.aid})));
     }
 
-    /// Push-delivery: drain feed + inbox and inject as a <sync> system
-    /// message. Runs before every model call so the model can't forget.
+    /// Push-delivery: drain feed + inbox + pushed notices (shell/sub
+    /// completions) and inject as a <sync> system message. A persistent
+    /// goal is re-surfaced here too. Runs before every model call so
+    /// nothing depends on the model remembering to poll.
     fn syncCoord(self: *Agent) !void {
-        const co = self.coord orelse return;
-        const lines = try co.drain(self.alloc, self.aid);
-        if (lines.len == 0) return;
+        var block = std.ArrayList(u8).init(self.alloc);
+        {
+            self.goal_state.mu.lock();
+            defer self.goal_state.mu.unlock();
+            if (self.goal_state.objective.len > 0) {
+                self.goal_state.turns += 1;
+                try block.writer().print("goal|{s}|turn {d}\n", .{
+                    self.goal_state.objective, self.goal_state.turns });
+            }
+        }
+        for (self.notices.drain()) |n| {
+            try block.appendSlice(n);
+            try block.append('\n');
+        }
+        if (self.coord) |co| {
+            const lines = try co.drain(self.alloc, self.aid);
+            if (lines.len > 0) {
+                try block.appendSlice(std.mem.trimRight(u8, lines, "\n"));
+                try block.append('\n');
+            }
+        }
+        if (block.items.len == 0) return;
         const m = try std.fmt.allocPrint(self.alloc, "<sync>\n{s}</sync>",
-            .{std.mem.trimRight(u8, lines, "\n")});
+            .{std.mem.trimRight(u8, block.items, "\n")});
         try self.messages.append(try llm.systemMessage(self.alloc, m));
     }
 
@@ -393,6 +489,11 @@ pub const Agent = struct {
             .coord = self.coord,
             .aid = self.aid,
             .memory = self.memory,
+            .shells = self.shells,
+            .subs = self.subs,
+            .notices = self.notices,
+            .goal_state = &self.goal_state,
+            .refine_req = &self.refine_req,
         };
     }
 
@@ -470,9 +571,12 @@ pub const Agent = struct {
         sub.approver = tctx.approver;
         sub.ui = tctx.ui;
         sub.livelog = tctx.livelog;
-        // join the shared fabric as a child of this agent ("main" -> "main/s")
+        // join the shared fabric as a child of this agent ("main" -> "main/s",
+        // or the explicit "main/sub-3" a spawn assigned)
         sub.coord = tctx.coord;
-        sub.aid = if (tctx.aid.len > 0)
+        sub.aid = if (tctx.sub_aid) |a|
+            a
+        else if (tctx.aid.len > 0)
             try std.fmt.allocPrint(aalloc, "{s}/s", .{tctx.aid})
         else
             "s";

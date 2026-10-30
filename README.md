@@ -122,11 +122,13 @@ Common flags: `-m/--model`, `--base-url`, `--api-key`, `-C/--cwd`,
 
 `read_file` `write_file` `edit_file` (exact-match replace) `list_dir`
 `glob` `grep` `delete` (files or trees, workspace-confined) `make_dir`
-`run_shell` (cmd /c on Windows, /bin/sh elsewhere, with timeout)
+`run_shell` (foreground, or `background:true` → handle + [shell-done])
 `web_fetch` (URL → text, HTML stripped) `web_search` (DuckDuckGo lite)
 `memory_append` `memory` (supermemory: remember/recall/profile/forget)
 `coord` (inter-agent claims, feed, inbox) `skill_load`
-`task` (subagent with fresh context, depth ≤ 2)
+`task` (subagent: `run` blocking, or `spawn`/`collect`/`list` async)
+`goal` (persistent objective, re-surfaced until completed)
+`refine` (schedule evidence-backed harness refinement at turn end)
 
 In interactive mode, write/shell tools ask for approval (`y`/`n`/`a`lways).
 `exec` and `improve` run unattended (auto-approve). Writes are confined to the
@@ -155,6 +157,38 @@ pull it back out:
 - point `memory_base` at a [self-hosted](https://supermemory.ai/docs/self-hosting/overview)
   supermemory-local to keep memory fully offline. `doctor` shows the
   configured namespace and pings the profile endpoint.
+
+## Long-running-work features
+
+Ideas ported from prime-agent's RLM/continual-harness design, adapted to
+this codebase's tool-loop architecture:
+
+- **background shells** — `run_shell{background:true}` returns a `sh-N`
+  handle immediately and keeps streaming output under a lock; the
+  `[shell-done sh-N exit N]` notice lands in the agent's `<sync>` block.
+  `{id, wait_ms}` blocks for finish, `{id}` snapshots, `{id, kill:true}`
+  kills. Servers, watchers and long builds never hold a turn hostage.
+- **async subagents** — `task{op:"spawn"}` launches a real subagent on a
+  detached thread and returns the handle (`<aid>/sub-N`) instantly; the
+  report arrives in the parent's inbox on completion — spawn is
+  admission, not result. `op:"collect"` snapshots or blocks for results,
+  `op:"list"` shows status. Spawned subs join the coordinator normally,
+  so their claims participate in conflict enforcement.
+- **persistent goals** — `goal{op:"set"}` pins an objective that the
+  `<sync>` block re-surfaces every turn until `goal complete`; goals are
+  mirrored into `coord status` so sibling agents see what everyone is
+  driving at.
+- **off-critical-path network** — memory capture ships turns to
+  supermemory on a detached thread; nothing user-visible awaits HTTP.
+- **continual refinement** — the `refine` tool (or
+  `xera-optimus refine [--global] <instructions>`) runs a separate model
+  pass over the trajectory and applies *precise* append/replace edits to
+  harness files (`memory.md`, `lessons.md`, `guardrails.md`,
+  `tool_guidance.md`, `skills/<name>.md`, `sub_agents/<name>/AGENT.md`)
+  with per-edit evidence. Pre-edit snapshots land in
+  `harness/snapshots/<ts>/`; every run appends to
+  `harness/refinement_history.jsonl`. Local (workspace) scope by
+  default; `--global` targets `~/.xera-optimus/harness`.
 
 ## The harness (Harness²)
 
@@ -276,6 +310,8 @@ src/live.zig      live event stream (~/.xera-optimus/live/*.jsonl)
 src/coord.zig     inter-agent coordination fabric: claims, feed, inbox
 src/memory.zig    supermemory v5 client: document add, hybrid search,
                   profile, forget (hosted or self-hosted)
+src/refine.zig    continual-harness refinement: trajectory → typed
+                  edits, snapshots, refinement_history.jsonl
 tools/livesite/   zero-dep 3D observability site (serve.py + Three.js)
 src/tui.zig       terminal layer: raw mode, alt screen, key input, styles
 src/tui_app.zig   Codex-style TUI: scrollback blocks, composer, spinner,

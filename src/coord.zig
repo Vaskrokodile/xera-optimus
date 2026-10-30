@@ -46,6 +46,14 @@ const Member = struct {
     cursor: u64 = 0,
 };
 
+/// A persistent objective an agent pursues across turns until it calls
+/// `goal complete` — prime-agent's goal mode, mirrored per-agent so
+/// `status` shows what everyone is ultimately driving at.
+const Goal = struct {
+    objective: []const u8 = "",
+    set_ms: i64 = 0,
+};
+
 /// Strip protocol-hostile bytes from a payload and cap its length.
 fn cleanData(alloc: std.mem.Allocator, s: []const u8) []const u8 {
     const n = @min(s.len, MAX_DATA);
@@ -111,6 +119,8 @@ pub const Coordinator = struct {
     feed: std.ArrayList([]const u8),
     inbox: std.StringHashMap(*std.ArrayList([]const u8)),
     seq: u64 = 0,
+    /// active goals keyed by aid (absent key = no goal)
+    goals: std.StringHashMap(Goal),
 
     pub fn init(alloc: std.mem.Allocator) Coordinator {
         return .{
@@ -119,6 +129,7 @@ pub const Coordinator = struct {
             .claims = std.ArrayList(Claim).init(alloc),
             .feed = std.ArrayList([]const u8).init(alloc),
             .inbox = std.StringHashMap(*std.ArrayList([]const u8)).init(alloc),
+            .goals = std.StringHashMap(Goal).init(alloc),
         };
     }
 
@@ -145,6 +156,21 @@ pub const Coordinator = struct {
         const m = self.memberLocked(aid) catch return;
         m.seen = std.time.milliTimestamp();
         if (is_new) self.emitLocked("+", aid, "");
+    }
+
+    /// Set or clear (objective == null) an agent's persistent goal.
+    pub fn setGoal(self: *Coordinator, aid: []const u8, objective: ?[]const u8) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        if (objective) |obj| {
+            self.goals.put(self.alloc.dupe(u8, aid) catch return, .{
+                .objective = cleanData(self.alloc, obj),
+                .set_ms = std.time.milliTimestamp(),
+            }) catch return;
+            self.emitLocked("g", aid, obj);
+        } else {
+            if (self.goals.fetchRemove(aid) != null) self.emitLocked("G", aid, "");
+        }
     }
 
     /// Short "what I'm doing" line, surfaced by `status`.
@@ -333,6 +359,9 @@ pub const Coordinator = struct {
             try out.appendSlice(aid);
             if (std.mem.eql(u8, aid, me)) try out.append('*');
             if (m.note.len > 0) try out.writer().print("=\"{s}\"", .{m.note});
+            if (self.goals.get(aid)) |g| {
+                if (g.objective.len > 0) try out.writer().print(" ⭕{s}", .{g.objective});
+            }
             var ci: usize = 0;
             for (self.claims.items) |c| {
                 if (!std.mem.eql(u8, c.aid, aid)) continue;
