@@ -164,6 +164,7 @@ const slash_cmds = [_]SlashCmd{
     .{ .name = "/harness", .desc = "harness components + validation" },
     .{ .name = "/help", .desc = "commands and keys" },
     .{ .name = "/improve", .desc = "harness² recursion (own command)" },
+    .{ .name = "/latent", .desc = "Latent Forge: /latent <fit|encode|sample|project|stability ...>", .takes_arg = true },
     .{ .name = "/leave", .desc = "leave the multiplayer session" },
     .{ .name = "/library", .desc = "adopted harness snapshots" },
     .{ .name = "/main", .desc = "return to the shared channel" },
@@ -1132,7 +1133,7 @@ pub const App = struct {
         }
     }
 
-    fn runSlash(self: *App, cmd: []const u8) !void {
+    fn runSlash(self: *App, cmd: []const u8) anyerror!void {
         const sp = std.mem.indexOfScalar(u8, cmd, ' ') orelse cmd.len;
         const name = cmd[0..sp];
         const arg = std.mem.trim(u8, if (sp < cmd.len) cmd[sp + 1 ..] else "", " ");
@@ -1158,6 +1159,23 @@ pub const App = struct {
             self.q.pushJob(.usage);
         } else if (std.mem.eql(u8, name, "/summarize") or std.mem.eql(u8, name, "/compact")) {
             self.q.pushJob(.summarize);
+        } else if (std.mem.eql(u8, name, "/latent")) {
+            if (arg.len == 0) {
+                try self.addSys("Latent Forge â€” learned latent spaces for tabular data (VAE).\n" ++
+                    "  /latent fit data.csv run1 [latent_dim=8 prior=gmm epochs=200 ...]\n" ++
+                    "  /latent project run1/latents.csv xy.csv clusters=5\n" ++
+                    "  /latent encode run1 new.csv z.csv Â· /latent sample run1 1000 synth.csv\n" ++
+                    "  /latent stability data.csv runs=5\n" ++
+                    "or describe the job in plain words; the agent calls the `latent` tool.");
+                return;
+            }
+            // Hand the request to the agent as a normal prompt so it picks the tool args,
+            // goes through approvals and shows up in history like any other turn.
+            self.composer.clearRetainingCapacity();
+            try self.composer.appendSlice("Use the `latent` tool (Latent Forge) for this request: ");
+            try self.composer.appendSlice(arg);
+            self.cursor = self.composer.items.len;
+            try self.submit();
         } else if (std.mem.eql(u8, name, "/skills")) {
             const skills = self.h.listSkills() catch &[_]harness.NamedItem{};
             if (skills.len == 0) {

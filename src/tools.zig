@@ -6,6 +6,7 @@ const config = @import("config.zig");
 const live = @import("live.zig");
 const coord_mod = @import("coord.zig");
 const memory_mod = @import("memory.zig");
+const latent = @import("latent.zig");
 
 pub const Ui = struct {
     ctx: *anyopaque,
@@ -269,6 +270,21 @@ pub const tools = [_]Tool{
         .danger = .shell,
         .run = runShell,
         .summary = sumCommand,
+    },
+    .{
+        .name = "latent",
+        .description = "Latent Forge: turn a tabular dataset (csv/parquet, mixed numeric+categorical) into a learned VAE latent space. " ++
+            "Actions: fit (train; data,out=run dir; writes model + latents.csv and prints held-out reconstruction error), " ++
+            "encode (model,data,out csv), sample (model,out csv,n synthetic rows), " ++
+            "project (data=latents.csv,out csv; UMAP/PCA 2-D/3-D + optional k-means clusters), " ++
+            "stability (data; trains `runs` seeds and prints a latent-stability JSON report). " ++
+            "fit/stability accept model flags: latent_dim, hidden, prior (gaussian|gmm), components, recon (nll|beta_div), beta_div, kl_weight, transformer (none|encoder|decoder|both), groups (json file, SE-VAE), epochs (use ~200), batch_size, lr, seed, device, categorical[]. " ++
+            "Paths are relative to the workspace; `out` must be inside it. Needs the Latent Forge checkout (config latent_home, default ~/latentforge).",
+        .schema_src = \\{"type":"object","properties":{"action":{"type":"string","enum":["fit","encode","sample","project","stability"]},"data":{"type":"string","description":"input csv/parquet (latents.csv for project)"},"model":{"type":"string","description":"run directory produced by fit"},"out":{"type":"string","description":"output run dir (fit) or csv file"},"latent_dim":{"type":"integer"},"hidden":{"type":"integer"},"prior":{"type":"string","enum":["gaussian","gmm"]},"components":{"type":"integer"},"recon":{"type":"string","enum":["nll","beta_div"]},"beta_div":{"type":"number"},"kl_weight":{"type":"number"},"transformer":{"type":"string","enum":["none","encoder","decoder","both"]},"groups":{"type":"string"},"epochs":{"type":"integer"},"batch_size":{"type":"integer"},"lr":{"type":"number"},"seed":{"type":"integer"},"device":{"type":"string"},"categorical":{"type":"array","items":{"type":"string"}},"n":{"type":"integer","description":"rows to sample"},"method":{"type":"string","enum":["umap","pca"]},"dims":{"type":"integer"},"clusters":{"type":"integer"},"runs":{"type":"integer"},"k":{"type":"integer"},"extra_args":{"type":"array","items":{"type":"string"},"description":"raw extra CLI flags"},"timeout_ms":{"type":"integer","description":"default 30 min"}},"required":["action"]}
+        ,
+        .danger = .shell,
+        .run = runLatent,
+        .summary = sumLatent,
     },
     .{
         .name = "memory_append",
@@ -972,7 +988,20 @@ fn runShell(ctx: *ToolCtx, args: std.json.Value) ![]const u8 {
 
     // ---- foreground ----
     const argv = try buildArgv(ctx.scratch, ctx, command);
+    return execArgv(ctx, argv, run_cwd, timeout_ms, null, command);
+}
+
+/// Spawn argv (no shell), capture stdout/stderr, kill after timeout_ms.
+fn execArgv(
+    ctx: *ToolCtx,
+    argv: []const []const u8,
+    run_cwd: []const u8,
+    timeout_ms: u64,
+    env: ?*const std.process.EnvMap,
+    label: []const u8,
+) ![]const u8 {
     var child = std.process.Child.init(argv, ctx.scratch);
+    child.env_map = env;
     child.stdin_behavior = .Ignore;
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Pipe;
@@ -1020,8 +1049,26 @@ fn runShell(ctx: *ToolCtx, args: std.json.Value) ![]const u8 {
     const stdout_t = try util.truncateMiddle(ctx.scratch, out_list.items, 30_000);
     const stderr_t = try util.truncateMiddle(ctx.scratch, err_list.items, 15_000);
     return std.fmt.allocPrint(ctx.alloc, "$ {s}\nexit: {d}\n--- stdout ---\n{s}\n--- stderr ---\n{s}", .{
-        command, code, stdout_t, stderr_t,
+        label, code, stdout_t, stderr_t,
     });
+}
+
+fn runLatent(ctx: *ToolCtx, args: std.json.Value) ![]const u8 {
+    const home = try latent.homeDir(ctx.scratch, ctx.cfg.latent_home);
+    const py = try latent.pythonExe(ctx.scratch, home, ctx.cfg.latent_python);
+    const built = try latent.build(ctx.scratch, ctx.cwd, py, args);
+    if (built.err) |e| return e;
+    if (built.out_path) |o| writeGuard(ctx, o) catch
+        return "error: `out` must be inside the workspace";
+    var env = try latent.childEnv(ctx.scratch, home);
+    defer env.deinit();
+    const timeout_ms: u64 = @intCast(@max(1000, util.jint(args, "timeout_ms") orelse 1_800_000));
+    return execArgv(ctx, built.argv, ctx.cwd, timeout_ms, &env, built.label);
+}
+
+fn sumLatent(ctx: *ToolCtx, args: std.json.Value) []const u8 {
+    _ = ctx;
+    return argStr(args, "action") orelse "?";
 }
 
 fn runMemoryAppend(ctx: *ToolCtx, args: std.json.Value) ![]const u8 {

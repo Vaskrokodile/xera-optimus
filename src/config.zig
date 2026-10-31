@@ -36,6 +36,10 @@ pub const Config = struct {
     sessions_dir: ?[]const u8 = null,
     /// max agent iterations per turn before forced stop
     max_iters: u32 = 60,
+    /// Latent Forge checkout used by the `latent` tool (default ~/latentforge)
+    latent_home: ?[]const u8 = null,
+    /// python interpreter for Latent Forge (default <latent_home>/.venv python, else `python`)
+    latent_python: ?[]const u8 = null,
     /// rough char budget for history before compaction kicks in
     history_budget: usize = 200_000,
     /// supermemory api key (SUPERMEMORY_API_KEY env or memory_key in config)
@@ -64,6 +68,8 @@ const FileSchema = struct {
     memory_base: ?[]const u8 = null,
     memory_namespace: ?[]const u8 = null,
     memory_auto: ?bool = null,
+    latent_home: ?[]const u8 = null,
+    latent_python: ?[]const u8 = null,
 };
 
 pub const Cli = struct {
@@ -101,6 +107,8 @@ pub fn load(alloc: std.mem.Allocator, cli: Cli) !Config {
         if (parsed.stream) |v| cfg.stream = v;
         if (parsed.shell) |v| cfg.shell = v;
         if (parsed.max_iters) |v| cfg.max_iters = v;
+        if (parsed.latent_home) |v| cfg.latent_home = v;
+        if (parsed.latent_python) |v| cfg.latent_python = v;
         if (parsed.approval) |v| {
             if (Approval.parse(v)) |a| cfg.approval = a;
         }
@@ -116,6 +124,8 @@ pub fn load(alloc: std.mem.Allocator, cli: Cli) !Config {
     if (util.getenv(alloc, "XERA_API_KEY_ENV")) |v| cfg.api_key_env = v;
     if (util.getenv(alloc, "XERA_MODEL")) |v| cfg.model = v;
     if (util.getenv(alloc, "XERA_SHELL")) |v| cfg.shell = v;
+    if (util.getenv(alloc, "XERA_LATENT_HOME")) |v| cfg.latent_home = v;
+    if (util.getenv(alloc, "XERA_LATENT_PY")) |v| cfg.latent_python = v;
     if (util.getenvBool(alloc, "XERA_NO_STREAM")) |b| {
         if (b) cfg.stream = false;
     }

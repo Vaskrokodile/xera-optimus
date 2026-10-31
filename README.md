@@ -190,6 +190,26 @@ this codebase's tool-loop architecture:
   `harness/refinement_history.jsonl`. Local (workspace) scope by
   default; `--global` targets `~/.xera-optimus/harness`.
 
+## Latent Forge (learned latent spaces)
+
+The agent has a `latent` tool that drives [Latent Forge](../../../latentforge) (tabular VAE ->
+latent space) through its CLI, so xera-optimus stays a single dependency-free binary.
+
+```
+/latent fit data.csv run1 latent_dim=8 prior=gmm epochs=200
+/latent project run1/latents.csv xy.csv clusters=5
+/latent encode run1 new.csv z.csv      /latent sample run1 1000 synth.csv
+/latent stability data.csv runs=5
+```
+Actions: `fit` `encode` `sample` `project` `stability`. `fit`/`stability` take the full model
+flags (latent_dim, hidden, prior gaussian|gmm, components, recon nll|beta_div, kl_weight,
+transformer, groups, epochs, lr, seed, categorical, ...). Paths are workspace-relative and
+`out` must stay inside the workspace. Approval is the same as `run_shell`.
+
+Config (`~/.xera-optimus/config.json` or env): `latent_home` / `XERA_LATENT_HOME` (default
+`~/latentforge`), `latent_python` / `XERA_LATENT_PY` (default `<latent_home>/.venv` python, else
+`python`). The checkout's `src` is put on `PYTHONPATH`, so it does not need to be pip-installed.
+
 ## The harness (Harness²)
 
 The editable system around the model lives in
